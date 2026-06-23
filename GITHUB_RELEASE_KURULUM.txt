@@ -1,0 +1,45 @@
+PAPATYA GITHUB RELEASE VE OTOMATIK GUNCELLEME
+
+1. Bu projeyi kendi GitHub repoma yukle.
+   Ornek:
+   git init
+   git remote remove origin
+   git remote add origin https://github.com/KULLANICI_ADI/REPO_ADI.git
+
+2. GitHub'da bir Personal Access Token olustur.
+   Gerekli kullanim: release yuklemek.
+
+3. Windows terminalinde token'i tanimla.
+   Ornek:
+   setx GH_TOKEN "BURAYA_TOKEN"
+
+4. Yeni terminal ac.
+
+5. Surum numarasini package.json icinde arttir.
+   Ornek:
+   1.0.0 -> 1.0.1
+
+6. Publish ayarini otomatik doldur.
+   npm run sync-publish
+
+7. Setup ve GitHub Release olustur.
+   npm run dist:github
+
+8. Cikan dosyalar:
+   release\Papatya-Setup-X.Y.Z.exe
+   release\latest.yml
+
+9. Arkadasina sadece setup dosyasini gonderebilirsin.
+   Node.js gerekmez.
+   Repo indirmesi gerekmez.
+
+10. Sonraki guncelleme icin yine ayni adimlar:
+   - package.json surumunu arttir
+   - npm run dist:github
+
+NOTLAR
+
+- Uygulama sadece kurulu surumde otomatik guncelleme kontrol eder.
+- Repo origin adresi GitHub degilse sync-publish hata verir.
+- GH_TOKEN yoksa GitHub release upload adimi basarisiz olur.
+- Arkadasin sadece setup kurar; guncelleme cikinca uygulama kendi indirir.

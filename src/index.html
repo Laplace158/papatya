@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Papatya</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="logo-lockup">
+          <div class="brand-mark"></div>
+          <div>
+            <strong>Papatya</strong>
+            <span>Clip recorder</span>
+          </div>
+        </div>
+        <nav class="side-nav">
+          <button class="nav-item active" data-view="studio">Kayıt</button>
+          <button class="nav-item" data-view="library">Kütüphane</button>
+          <button class="nav-item" data-view="editor">Editör</button>
+        </nav>
+        <div class="status-card">
+          <span id="recordDot" class="dot"></span>
+          <div>
+            <strong id="recordState">Starting</strong>
+            <small id="bufferState">Buffer preparing</small>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="titlebar">
+          <div class="drag-region"></div>
+          <button class="win-btn" id="minimizeBtn" title="Minimize">-</button>
+          <button class="win-btn" id="maximizeBtn" title="Maximize">□</button>
+          <button class="win-btn close" id="hideBtn" title="Tray'e gizle">×</button>
+        </header>
+
+        <section class="view active" id="studio">
+          <div class="studio-grid">
+            <section class="hero-panel">
+              <div class="hero-top">
+                <div class="hero-copy">
+                  <p class="eyebrow">Papatya kayıt masası</p>
+                  <h1>Klip hazır, dikkat dağıtmadan arkada çalışır.</h1>
+                  <p>Ayarladığın süreyi segment buffer üzerinden kaydeder. Kısayola bastığında klip çıkar, kısa bir ses duyarsın.</p>
+                </div>
+                <aside class="sound-panel">
+                  <div class="sound-head">
+                    <div>
+                      <strong>Bildirim sesi</strong>
+                      <small>Klip alınınca çalar</small>
+                    </div>
+                    <button id="addSoundBtn" class="secondary" type="button">Ekle</button>
+                  </div>
+                  <div id="notificationSoundList" class="sound-list"></div>
+                  <div class="sound-actions">
+                    <button id="deleteSoundBtn" class="secondary" type="button" disabled>Sil</button>
+                    <small id="soundNote">Dosya silinirse üstü çizilir.</small>
+                  </div>
+                </aside>
+              </div>
+              <div class="preview-panel">
+                <video id="preview" muted autoplay playsinline></video>
+                <div class="preview-shade"></div>
+                <div class="preview-badges">
+                  <span id="qualityBadge">720p</span>
+                  <span id="hotkeyBadge">F8</span>
+                </div>
+              </div>
+              <div class="hero-actions">
+                <button id="saveNowBtn" class="primary">Klip al</button>
+                <button id="openLibraryBtn" class="secondary">Kütüphane</button>
+              </div>
+            </section>
+
+            <aside class="settings-panel">
+              <div class="panel-title">
+                <strong>Kayıt ayarları</strong>
+                <small>Değiştirince Uygula</small>
+              </div>
+              <label class="field">
+                <span>Kısayol</span>
+                <input id="hotkeyInput" value="F8" />
+              </label>
+              <label class="field">
+                <span>Klip süresi</span>
+                <input id="durationInput" type="number" min="5" max="180" step="5" />
+              </label>
+              <label class="field">
+                <span>Çözünürlük</span>
+                <select id="qualityInput">
+                  <option value="480">480p</option>
+                  <option value="720">720p</option>
+                  <option value="1080">1080p</option>
+                  <option value="2k">2K</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>FPS</span>
+                <select id="fpsInput">
+                  <option value="30">30</option>
+                  <option value="60">60</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Kodlayıcı</span>
+                <select id="encoderInput">
+                  <option value="gpu">GPU NVENC</option>
+                  <option value="compat">Uyumluluk</option>
+                </select>
+              </label>
+              <label class="field toggle">
+                <span>Sistem sesi</span>
+                <input id="audioInput" type="checkbox" />
+              </label>
+              <label class="field toggle">
+                <span>Mikrofon</span>
+                <input id="micInput" type="checkbox" />
+              </label>
+              <label class="field">
+                <span>Mikrofon kaynağı</span>
+                <select id="micDeviceInput"></select>
+              </label>
+              <div class="audio-tools">
+                <div class="audio-tools-head">
+                  <strong>Sesi gelmeyecek programlar</strong>
+                  <button id="refreshAudioAppsBtn" class="secondary" type="button">Yenile</button>
+                </div>
+                <div id="audioAppList" class="audio-app-list"></div>
+                <small id="audioFilterNote">Tik attığın programların sesi kayda alınmaz.</small>
+              </div>
+              <div class="stat-grid">
+                <div><strong id="durationStat">30s</strong><span>Süre</span></div>
+                <div><strong id="qualityStat">720p</strong><span>Kalite</span></div>
+                <div><strong id="fpsStat">60</strong><span>FPS</span></div>
+              </div>
+              <button id="saveSettingsBtn" class="secondary wide">Uygula</button>
+              <div class="storage-line">
+                <span>Klasör</span>
+                <strong id="clipPathStat">Videos</strong>
+              </div>
+              <p id="settingsNote" class="note"></p>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="library">
+          <div class="library-layout">
+            <section class="player-card">
+              <div class="section-head">
+                <div>
+                  <p class="eyebrow">Kütüphane</p>
+                  <h2>Klip oynatıcı</h2>
+                </div>
+                <button id="refreshClipsBtn" class="secondary">Yenile</button>
+              </div>
+              <div class="player-pane">
+                <video id="clipPlayer" controls preload="auto"></video>
+                <div id="emptyPlayer" class="empty-player">Sağdaki listeden klibe tek tıkla</div>
+              </div>
+              <div class="clip-meta-row">
+                <div id="selectedClip" class="selected-clip">Bir klip seç</div>
+                <div class="clip-actions">
+                  <input id="clipNameInput" placeholder="Klip adi" disabled />
+                  <button id="renameSelectedBtn" class="secondary" disabled>Ad kaydet</button>
+                  <button id="stripAudioBtn" class="secondary" disabled>Sesi kaldır</button>
+                  <button id="deleteSelectedBtn" class="danger-btn">Sil</button>
+                </div>
+              </div>
+            </section>
+            <aside class="clip-rail">
+              <div class="rail-head">
+                <strong>Klipler</strong>
+                <small>Tek tık oynat, çift tık klasör</small>
+              </div>
+              <div id="clipGrid" class="clip-list"></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="editor">
+          <div class="editor-layout">
+            <section class="editor-stage">
+              <div class="section-head">
+                <div>
+                  <p class="eyebrow">Editör</p>
+                  <h2>Klip kırp</h2>
+                </div>
+                <button id="exportTrimBtn" class="primary">Kes ve kaydet</button>
+              </div>
+              <div class="player-pane editor-player">
+                <video id="editorPlayer" controls preload="auto"></video>
+                <div id="cropLayer" class="crop-layer">
+                  <div id="cropBox" class="crop-box">
+                    <span class="crop-handle nw" data-handle="nw"></span>
+                    <span class="crop-handle ne" data-handle="ne"></span>
+                    <span class="crop-handle sw" data-handle="sw"></span>
+                    <span class="crop-handle se" data-handle="se"></span>
+                  </div>
+                </div>
+                <div id="emptyEditor" class="empty-player">Düzenlemek için klip seç</div>
+              </div>
+            </section>
+            <aside class="editor-tools">
+              <label class="field">
+                <span>Klip</span>
+                <select id="editorClipSelect"></select>
+              </label>
+              <div class="range-fields">
+                <label class="field">
+                  <span>Başlangıç sn</span>
+                  <input id="trimStartInput" type="number" min="0" step="0.1" value="0" />
+                </label>
+                <label class="field">
+                  <span>Bitiş sn</span>
+                  <input id="trimEndInput" type="number" min="0" step="0.1" value="0" />
+                </label>
+              </div>
+              <div class="tool-row">
+                <button id="markStartBtn" class="secondary">Başlangıç işaretle</button>
+                <button id="markEndBtn" class="secondary">Bitiş işaretle</button>
+              </div>
+              <button id="resetCropBtn" class="secondary wide">Kırpma alanını sıfırla</button>
+              <p id="editorNote" class="note">Köşelerden tutup görüntü alanını ayarla, sonra kaydet.</p>
+            </aside>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast"></div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

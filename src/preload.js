@@ -1,0 +1,31 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('clipforge', {
+  init: () => ipcRenderer.invoke('app:init'),
+  saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
+  listClips: () => ipcRenderer.invoke('clips:list'),
+  saveClip: (payload) => ipcRenderer.invoke('clip:save', payload),
+  trimClip: (payload) => ipcRenderer.invoke('clip:trim', payload),
+  renameClip: (payload) => ipcRenderer.invoke('clip:rename', payload),
+  stripAudio: (payload) => ipcRenderer.invoke('clip:strip-audio', payload),
+  revealClip: (clipPath) => ipcRenderer.invoke('clip:reveal', clipPath),
+  listAudioApps: () => ipcRenderer.invoke('audio:list-apps'),
+  listNotificationSounds: () => ipcRenderer.invoke('sound:list'),
+  addNotificationSound: () => ipcRenderer.invoke('sound:add'),
+  selectNotificationSound: (id) => ipcRenderer.invoke('sound:select', id),
+  deleteNotificationSound: (id) => ipcRenderer.invoke('sound:delete', id),
+  resetBuffer: () => ipcRenderer.invoke('buffer:reset'),
+  writeBufferChunk: (payload) => ipcRenderer.invoke('buffer:chunk', payload),
+  saveBufferedClip: (payload) => ipcRenderer.invoke('buffer:save-clip', payload),
+  startGpuCapture: (payload) => ipcRenderer.invoke('gpu:start', payload),
+  stopGpuCapture: () => ipcRenderer.invoke('gpu:stop'),
+  saveGpuClip: (payload) => ipcRenderer.invoke('gpu:save-clip', payload),
+  deleteClip: (clipPath) => ipcRenderer.invoke('clip:delete', clipPath),
+  minimize: () => ipcRenderer.invoke('window:minimize'),
+  hide: () => ipcRenderer.invoke('window:hide'),
+  toggleMaximize: () => ipcRenderer.invoke('window:toggle-maximize'),
+  onSaveClip: (callback) => ipcRenderer.on('save-clip', callback),
+  onHotkeyStatus: (callback) => ipcRenderer.on('hotkey-status', (_event, value) => callback(value)),
+  onGpuStatus: (callback) => ipcRenderer.on('gpu-status', (_event, value) => callback(value)),
+  onUpdateStatus: (callback) => ipcRenderer.on('update-status', (_event, value) => callback(value))
+});
