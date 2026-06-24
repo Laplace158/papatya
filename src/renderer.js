@@ -30,7 +30,17 @@ const state = {
   selectedClip: null,
   selectedShot: null,
   libraryMode: 'clips',
+  editorMode: 'clips',
   editorClip: null,
+  editorShot: null,
+  imageEditor: {
+    image: null,
+    painting: false,
+    tool: 'crop',
+    lastPoint: null,
+    brushColor: '#f1c84b',
+    brushSize: 8
+  },
   audioApps: [],
   notificationSounds: [],
   crop: { x: 0.05, y: 0.05, w: 0.9, h: 0.9 },
@@ -77,16 +87,22 @@ function clipBaseName(clip) {
   return (clip?.name || '').replace(/\.(webm|mp4)$/i, '');
 }
 
-function setClipNameInput(clip) {
+function assetBaseName(item) {
+  return (item?.name || '').replace(/\.(webm|mp4|png|jpe?g|webp)$/i, '');
+}
+
+function setClipNameInput(item) {
   const input = $('clipNameInput');
   const button = $('renameSelectedBtn');
   const stripButton = $('stripAudioBtn');
+  const deleteButton = $('deleteSelectedBtn');
   if (!input || !button) return;
 
-  input.value = clip ? clipBaseName(clip) : '';
-  input.disabled = !clip;
-  button.disabled = !clip;
-  if (stripButton) stripButton.disabled = !clip;
+  input.value = item ? assetBaseName(item) : '';
+  input.disabled = !item;
+  button.disabled = !item;
+  if (stripButton) stripButton.disabled = state.libraryMode !== 'clips' || !state.selectedClip;
+  if (deleteButton) deleteButton.disabled = !item;
 }
 
 function setLibraryMode(mode) {
@@ -94,13 +110,15 @@ function setLibraryMode(mode) {
   $('clipsModeBtn')?.classList.toggle('active', state.libraryMode === 'clips');
   $('shotsModeBtn')?.classList.toggle('active', state.libraryMode === 'screenshots');
   $('libraryTypeLabel').textContent = state.libraryMode === 'clips' ? 'Klipler' : 'Resimler';
+  $('libraryHeading').textContent = state.libraryMode === 'clips' ? 'Klip oynatıcı' : 'Resim önizleme';
   $('libraryHint').textContent = state.libraryMode === 'clips'
     ? 'Tek tık oynat, çift tık klasör'
     : 'Tek tık göster, çift tık klasör';
-  $('clipNameInput').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
-  $('renameSelectedBtn').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
+  const selectedItem = state.libraryMode === 'clips' ? state.selectedClip : state.selectedShot;
+  $('clipNameInput').disabled = !selectedItem;
+  $('renameSelectedBtn').disabled = !selectedItem;
   $('stripAudioBtn').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
-  $('deleteSelectedBtn').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
+  $('deleteSelectedBtn').disabled = !selectedItem;
   if (state.libraryMode === 'clips') hideShotPreview();
 }
 
@@ -120,9 +138,11 @@ function loadClipIntoPlayer(player, clip) {
 
 function hideShotPreview() {
   const shot = $('shotPlayer');
+  const video = $('clipPlayer');
   if (!shot) return;
   shot.style.display = 'none';
   shot.removeAttribute('src');
+  video?.classList.remove('hidden-media');
 }
 
 function showShotPreview(item) {
@@ -132,6 +152,7 @@ function showShotPreview(item) {
   video.pause();
   video.removeAttribute('src');
   video.load();
+  video.classList.add('hidden-media');
   shot.src = item.url;
   shot.style.display = 'block';
 }
@@ -191,6 +212,7 @@ function syncPreviewAttachment() {
 function syncViewMedia(view) {
   if (view !== 'library') $('clipPlayer')?.pause();
   if (view !== 'editor') $('editorPlayer')?.pause();
+  if (view !== 'editor') endImagePaint();
   if (view === 'editor') requestAnimationFrame(drawCropBox);
 }
 
@@ -920,6 +942,7 @@ function renderScreenshots(shots) {
   if (state.selectedShot) {
     state.selectedShot = shots.find((shot) => shot.path === state.selectedShot.path) || null;
   }
+  if (state.editorMode === 'screenshots') populateEditorSources();
   const grid = $('clipGrid');
   grid.innerHTML = '';
 
@@ -952,33 +975,55 @@ function renderScreenshots(shots) {
   }
 
   if (state.selectedShot) highlightSelected();
+  setClipNameInput(state.selectedShot);
 }
 
-function populateEditorClips() {
+function populateEditorSources() {
   const select = $('editorClipSelect');
   if (!select) return;
-  const current = state.editorClip?.path || select.value;
+  const isImageMode = state.editorMode === 'screenshots';
+  const items = isImageMode ? state.screenshots : state.clips;
+  const current = (isImageMode ? state.editorShot?.path : state.editorClip?.path) || select.value;
   select.innerHTML = '';
+  $('editorClipsModeBtn')?.classList.toggle('active', !isImageMode);
+  $('editorShotsModeBtn')?.classList.toggle('active', isImageMode);
+  $('editorSourceLabel').textContent = isImageMode ? 'Resim' : 'Klip';
 
-  if (!state.clips.length) {
+  if (!items.length) {
     const option = document.createElement('option');
     option.value = '';
-    option.textContent = 'Klip yok';
+    option.textContent = isImageMode ? 'Resim yok' : 'Klip yok';
     select.appendChild(option);
+    if (isImageMode) {
+      state.editorShot = null;
+      clearImageEditor();
+      $('editorPlayer')?.classList.add('hidden-media');
+      $('imageEditorCanvas')?.classList.add('active');
+    } else {
+      state.editorClip = null;
+      clearPlayerSource($('editorPlayer'));
+      clearImageEditor();
+      $('editorPlayer')?.classList.remove('hidden-media');
+    }
     $('emptyEditor').classList.remove('hidden');
     return;
   }
 
-  for (const clip of state.clips) {
+  for (const item of items) {
     const option = document.createElement('option');
-    option.value = clip.path;
-    option.textContent = clip.name;
+    option.value = item.path;
+    option.textContent = item.name;
     select.appendChild(option);
   }
 
-  const next = state.clips.find((clip) => clip.path === current) || state.clips[0];
+  const next = items.find((item) => item.path === current) || items[0];
   select.value = next.path;
-  setEditorClip(next);
+  if (isImageMode) setEditorShot(next);
+  else setEditorClip(next);
+}
+
+function populateEditorClips() {
+  populateEditorSources();
 }
 
 function highlightSelected() {
@@ -1007,7 +1052,7 @@ function previewScreenshot(shot) {
   $('selectedClip').textContent = shot.path;
   $('selectedClip').title = shot.path;
   $('emptyPlayer').classList.add('hidden');
-  setClipNameInput(null);
+  setClipNameInput(shot);
   showShotPreview(shot);
 }
 
@@ -1029,10 +1074,156 @@ async function refreshLibraryPane() {
   renderLibraryPane();
 }
 
+function setEditorMode(mode) {
+  state.editorMode = mode === 'screenshots' ? 'screenshots' : 'clips';
+  const isImageMode = state.editorMode === 'screenshots';
+  $('editorClipsModeBtn')?.classList.toggle('active', !isImageMode);
+  $('editorShotsModeBtn')?.classList.toggle('active', isImageMode);
+  $('videoTrimTools')?.classList.toggle('hidden', isImageMode);
+  $('markTools')?.classList.toggle('hidden', isImageMode);
+  $('imagePaintTools')?.classList.toggle('hidden', !isImageMode);
+  $('editorHeading').textContent = isImageMode ? 'Resim düzenle' : 'Klip kırp';
+  $('exportTrimBtn').textContent = isImageMode ? 'Resmi kaydet' : 'Kes ve kaydet';
+  $('editorNote').textContent = isImageMode
+    ? 'Kırp modunda alan seç, boya modunda resmin üstüne çiz.'
+    : 'Köşelerden tutup görüntü alanını ayarla, sonra kaydet.';
+  $('editorPlayer')?.classList.toggle('hidden-media', isImageMode);
+  $('imageEditorCanvas')?.classList.toggle('active', isImageMode);
+  setImageTool(isImageMode ? state.imageEditor.tool : 'crop');
+  if (!isImageMode) clearImageEditor();
+  populateEditorSources();
+}
+
+function clearImageEditor() {
+  const canvas = $('imageEditorCanvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx?.clearRect(0, 0, canvas.width, canvas.height);
+  canvas.classList.remove('active', 'painting');
+  state.imageEditor.image = null;
+  state.imageEditor.painting = false;
+  state.imageEditor.lastPoint = null;
+}
+
+function setImageTool(tool) {
+  state.imageEditor.tool = tool;
+  const isPaint = tool === 'brush' || tool === 'eraser';
+  $('cropToolBtn')?.classList.toggle('active', tool === 'crop');
+  $('brushToolBtn')?.classList.toggle('active', tool === 'brush');
+  $('eraserToolBtn')?.classList.toggle('active', tool === 'eraser');
+  $('cropLayer')?.classList.toggle('paint-mode', isPaint);
+  $('imageEditorCanvas')?.classList.toggle('painting', isPaint);
+}
+
+function drawImageEditorBase() {
+  const canvas = $('imageEditorCanvas');
+  const image = state.imageEditor.image;
+  if (!canvas || !image) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = image.naturalWidth || image.width;
+  canvas.height = image.naturalHeight || image.height;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  requestAnimationFrame(drawCropBox);
+}
+
+function setEditorShot(shot) {
+  const player = $('editorPlayer');
+  const canvas = $('imageEditorCanvas');
+  if (!canvas || !shot) return;
+  clearPlayerSource(player);
+  player?.classList.add('hidden-media');
+  canvas.classList.add('active');
+  state.editorShot = shot;
+  state.editorClip = null;
+  $('emptyEditor').classList.remove('hidden');
+  $('editorNote').textContent = 'Resim yükleniyor...';
+
+  const image = new Image();
+  image.onload = () => {
+    state.imageEditor.image = image;
+    drawImageEditorBase();
+    $('emptyEditor').classList.add('hidden');
+    $('editorNote').textContent = shot.name;
+    resetCrop();
+  };
+  image.onerror = () => {
+    $('editorNote').textContent = 'Resim açılamadı.';
+    toast('Resim açılamadı.');
+  };
+  image.src = shot.url;
+}
+
+function getCanvasMediaPoint(event) {
+  const canvas = $('imageEditorCanvas');
+  const rect = getRenderedEditorRect();
+  if (!canvas || !rect.width || !rect.height) return null;
+  const x = (event.clientX - rect.pageLeft) / rect.width;
+  const y = (event.clientY - rect.pageTop) / rect.height;
+  if (x < 0 || y < 0 || x > 1 || y > 1) return null;
+  return {
+    x: x * canvas.width,
+    y: y * canvas.height
+  };
+}
+
+function paintImageLine(from, to) {
+  const canvas = $('imageEditorCanvas');
+  if (!canvas || !from || !to) return;
+  const ctx = canvas.getContext('2d');
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = state.imageEditor.brushSize;
+  if (state.imageEditor.tool === 'eraser') {
+    ctx.globalCompositeOperation = 'destination-out';
+  } else {
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.strokeStyle = state.imageEditor.brushColor;
+  }
+  ctx.beginPath();
+  ctx.moveTo(from.x, from.y);
+  ctx.lineTo(to.x, to.y);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function beginImagePaint(event) {
+  if (state.editorMode !== 'screenshots' || state.imageEditor.tool === 'crop') return;
+  const point = getCanvasMediaPoint(event);
+  if (!point) return;
+  state.imageEditor.painting = true;
+  state.imageEditor.lastPoint = point;
+  paintImageLine(point, point);
+  event.preventDefault();
+}
+
+function moveImagePaint(event) {
+  if (!state.imageEditor.painting) return;
+  const point = getCanvasMediaPoint(event);
+  if (!point) return;
+  paintImageLine(state.imageEditor.lastPoint, point);
+  state.imageEditor.lastPoint = point;
+}
+
+function endImagePaint() {
+  state.imageEditor.painting = false;
+  state.imageEditor.lastPoint = null;
+}
+
+function clearImagePaint() {
+  if (!state.imageEditor.image) return;
+  drawImageEditorBase();
+  toast('Boyama temizlendi.');
+}
+
 function setEditorClip(clip) {
   const player = $('editorPlayer');
   if (!player || !clip) return;
+  clearImageEditor();
+  player.classList.remove('hidden-media');
   state.editorClip = clip;
+  state.editorShot = null;
   $('trimStartInput').value = '0';
   $('trimEndInput').value = '0';
   loadClipIntoPlayer(player, clip);
@@ -1075,6 +1266,30 @@ function syncEditorDuration() {
 }
 
 async function deleteSelectedClip() {
+  if (state.libraryMode === 'screenshots') {
+    if (!state.selectedShot) {
+      toast('Silmek icin bir resim sec.');
+      return;
+    }
+
+    const deletingPath = state.selectedShot.path;
+    const shots = await window.clipforge.deleteScreenshot(deletingPath);
+    state.selectedShot = null;
+    if (state.editorShot?.path === deletingPath) {
+      state.editorShot = null;
+      clearImageEditor();
+    }
+    $('selectedClip').textContent = 'Bir resim sec';
+    $('selectedClip').removeAttribute('title');
+    $('emptyPlayer').classList.remove('hidden');
+    setClipNameInput(null);
+    state.screenshots = shots;
+    renderLibraryPane();
+    populateEditorSources();
+    toast('Resim silindi.');
+    return;
+  }
+
   if (!state.selectedClip) {
     toast('Silmek icin bir klip sec.');
     return;
@@ -1099,6 +1314,39 @@ async function deleteSelectedClip() {
 }
 
 async function renameSelectedClip() {
+  if (state.libraryMode === 'screenshots') {
+    if (!state.selectedShot) {
+      toast('Ismini degistirmek icin bir resim sec.');
+      return;
+    }
+
+    const name = $('clipNameInput').value.trim();
+    if (!name) {
+      toast('Resim adi bos olamaz.');
+      return;
+    }
+
+    const oldPath = state.selectedShot.path;
+    const editorWasSameShot = state.editorShot?.path === oldPath;
+    try {
+      const result = await window.clipforge.renameScreenshot({ shotPath: oldPath, name });
+      state.screenshots = result.screenshots;
+      renderLibraryPane();
+      const renamed = result.screenshots.find((shot) => shot.path === result.filePath);
+      if (renamed) {
+        previewScreenshot(renamed);
+        if (editorWasSameShot) setEditorShot(renamed);
+      }
+      populateEditorSources();
+      toast('Resim adi kaydedildi.');
+    } catch (error) {
+      toast(`Ad degistirme basarisiz: ${error.message}`);
+      const shot = state.screenshots.find((item) => item.path === oldPath);
+      if (shot) previewScreenshot(shot);
+    }
+    return;
+  }
+
   if (!state.selectedClip) {
     toast('Ismini degistirmek icin bir klip sec.');
     return;
@@ -1154,7 +1402,51 @@ async function stripSelectedAudio() {
   }
 }
 
+async function exportEditedScreenshot() {
+  if (!state.editorShot || !state.imageEditor.image) {
+    toast('Once editorde bir resim sec.');
+    return;
+  }
+
+  const canvas = $('imageEditorCanvas');
+  const x = Math.round(state.crop.x * canvas.width);
+  const y = Math.round(state.crop.y * canvas.height);
+  const w = Math.max(1, Math.round(state.crop.w * canvas.width));
+  const h = Math.max(1, Math.round(state.crop.h * canvas.height));
+  const output = document.createElement('canvas');
+  output.width = w;
+  output.height = h;
+  output.getContext('2d').drawImage(canvas, x, y, w, h, 0, 0, w, h);
+
+  $('editorNote').textContent = 'Resim kaydediliyor...';
+  try {
+    const result = await window.clipforge.saveEditedScreenshot({
+      shotPath: state.editorShot.path,
+      dataUrl: output.toDataURL('image/png')
+    });
+    state.screenshots = result.screenshots;
+    const saved = result.screenshots.find((shot) => shot.path === result.filePath) || result.screenshots[0];
+    if (saved) {
+      state.libraryMode = 'screenshots';
+      renderLibraryPane();
+      previewScreenshot(saved);
+      setEditorShot(saved);
+    }
+    populateEditorSources();
+    toast('Resim kaydedildi.');
+    $('editorNote').textContent = 'Resim kaydedildi.';
+  } catch (error) {
+    $('editorNote').textContent = error.message;
+    toast(`Resim kaydedilemedi: ${error.message}`);
+  }
+}
+
 async function exportTrimmedClip() {
+  if (state.editorMode === 'screenshots') {
+    await exportEditedScreenshot();
+    return;
+  }
+
   if (!state.editorClip) {
     toast('Once editorde bir klip sec.');
     return;
@@ -1205,41 +1497,47 @@ function resetCrop() {
   drawCropBox();
 }
 
-function getRenderedVideoRect() {
+function getRenderedEditorRect() {
   const player = $('editorPlayer');
-  const pane = player.parentElement;
+  const canvas = $('imageEditorCanvas');
+  const isImageMode = state.editorMode === 'screenshots';
+  const pane = (isImageMode ? canvas : player).parentElement;
   const paneRect = pane.getBoundingClientRect();
-  const videoWidth = player.videoWidth || 16;
-  const videoHeight = player.videoHeight || 9;
+  const mediaWidth = isImageMode ? canvas.width || 16 : player.videoWidth || 16;
+  const mediaHeight = isImageMode ? canvas.height || 9 : player.videoHeight || 9;
   const paneRatio = paneRect.width / paneRect.height;
-  const videoRatio = videoWidth / videoHeight;
+  const mediaRatio = mediaWidth / mediaHeight;
 
   let width = paneRect.width;
   let height = paneRect.height;
   let left = 0;
   let top = 0;
 
-  if (paneRatio > videoRatio) {
-    width = height * videoRatio;
+  if (paneRatio > mediaRatio) {
+    width = height * mediaRatio;
     left = (paneRect.width - width) / 2;
   } else {
-    height = width / videoRatio;
+    height = width / mediaRatio;
     top = (paneRect.height - height) / 2;
   }
 
-  return { left, top, width, height };
+  return { left, top, width, height, pageLeft: paneRect.left + left, pageTop: paneRect.top + top };
 }
 
 function drawCropBox() {
   const layer = $('cropLayer');
   const box = $('cropBox');
   const player = $('editorPlayer');
-  if (!layer || !box || !state.editorClip || !player.videoWidth) {
+  const canvas = $('imageEditorCanvas');
+  const hasMedia = state.editorMode === 'screenshots'
+    ? Boolean(state.editorShot && canvas?.width)
+    : Boolean(state.editorClip && player.videoWidth);
+  if (!layer || !box || !hasMedia) {
     layer?.classList.remove('ready');
     return;
   }
 
-  const rect = getRenderedVideoRect();
+  const rect = getRenderedEditorRect();
   layer.classList.add('ready');
   box.style.left = `${rect.left + state.crop.x * rect.width}px`;
   box.style.top = `${rect.top + state.crop.y * rect.height}px`;
@@ -1259,10 +1557,10 @@ function clampCrop(crop) {
 }
 
 function beginCropDrag(event) {
-  if (!state.editorClip) return;
-  keepEditorVideoPlaying();
+  if (!state.editorClip && !state.editorShot) return;
+  if (state.editorMode === 'clips') keepEditorVideoPlaying();
   const handle = event.target.dataset.handle || 'move';
-  const rect = getRenderedVideoRect();
+  const rect = getRenderedEditorRect();
   state.cropDrag = {
     handle,
     startX: event.clientX,
@@ -1374,7 +1672,14 @@ function bindUi() {
     loadNotificationSounds().catch(() => {});
   });
   window.addEventListener('blur', syncPreviewAttachment);
+  $('editorClipsModeBtn').addEventListener('click', () => setEditorMode('clips'));
+  $('editorShotsModeBtn').addEventListener('click', () => setEditorMode('screenshots'));
   $('editorClipSelect').addEventListener('change', (event) => {
+    if (state.editorMode === 'screenshots') {
+      const shot = state.screenshots.find((item) => item.path === event.target.value);
+      if (shot) setEditorShot(shot);
+      return;
+    }
     const clip = state.clips.find((item) => item.path === event.target.value);
     if (clip) setEditorClip(clip);
   });
@@ -1390,7 +1695,21 @@ function bindUi() {
   });
   $('exportTrimBtn').addEventListener('click', exportTrimmedClip);
   $('resetCropBtn').addEventListener('click', resetCrop);
+  $('cropToolBtn').addEventListener('click', () => setImageTool('crop'));
+  $('brushToolBtn').addEventListener('click', () => setImageTool('brush'));
+  $('eraserToolBtn').addEventListener('click', () => setImageTool('eraser'));
+  $('brushColorInput').addEventListener('input', (event) => {
+    state.imageEditor.brushColor = event.target.value || '#f1c84b';
+  });
+  $('brushSizeInput').addEventListener('input', (event) => {
+    state.imageEditor.brushSize = Math.max(2, Math.min(60, Number(event.target.value || 8)));
+  });
+  $('clearPaintBtn').addEventListener('click', clearImagePaint);
   $('cropBox').addEventListener('pointerdown', beginCropDrag);
+  $('imageEditorCanvas').addEventListener('pointerdown', beginImagePaint);
+  $('imageEditorCanvas').addEventListener('pointermove', moveImagePaint);
+  $('imageEditorCanvas').addEventListener('pointerup', endImagePaint);
+  $('imageEditorCanvas').addEventListener('pointerleave', endImagePaint);
   document.addEventListener('pointermove', moveCropDrag);
   document.addEventListener('pointerup', endCropDrag);
   $('editorPlayer').addEventListener('loadedmetadata', syncEditorDuration);
@@ -1427,6 +1746,7 @@ async function boot() {
         .then((shots) => {
           state.screenshots = shots;
           if (state.libraryMode === 'screenshots') renderLibraryPane();
+          if (state.editorMode === 'screenshots') populateEditorSources();
         })
         .catch(() => {});
       toast('Ekran goruntusu kaydedildi.');

@@ -382,11 +382,32 @@ video {
 }
 
 #shotPlayer {
+  position: absolute;
+  inset: 0;
   display: none;
   width: 100%;
   height: 100%;
   object-fit: contain;
   background: #04070c;
+}
+
+#clipPlayer.hidden-media,
+#editorPlayer.hidden-media {
+  display: none;
+}
+
+#imageEditorCanvas {
+  position: absolute;
+  inset: 0;
+  display: none;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #04070c;
+}
+
+#imageEditorCanvas.active {
+  display: block;
 }
 
 .preview-shade {
@@ -716,6 +737,10 @@ input:disabled {
   display: none;
 }
 
+.hidden {
+  display: none !important;
+}
+
 .danger-btn {
   color: #ffd1d4;
   background: rgba(243, 90, 95, 0.14);
@@ -835,6 +860,10 @@ input:disabled {
   pointer-events: none;
 }
 
+.crop-layer.paint-mode .crop-box {
+  pointer-events: none;
+}
+
 .crop-box {
   position: absolute;
   display: none;
@@ -914,6 +943,46 @@ input:disabled {
   display: grid;
   grid-template-columns: 1fr 1fr;
   margin-bottom: 14px;
+}
+
+.tool-row.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.editor-mode-toggle {
+  width: 100%;
+  margin-bottom: 14px;
+}
+
+.editor-mode-toggle .mode-chip {
+  width: 100%;
+}
+
+.image-paint-tools {
+  display: grid;
+  gap: 10px;
+  margin: 8px 0 12px;
+}
+
+.paint-grid {
+  display: grid;
+  grid-template-columns: 86px 1fr;
+  gap: 10px;
+}
+
+.paint-grid input[type="color"] {
+  padding: 4px;
+}
+
+.secondary.active {
+  color: #fff4cc;
+  border-color: rgba(241, 200, 75, 0.5);
+  background: rgba(241, 200, 75, 0.14);
+}
+
+#imageEditorCanvas.painting {
+  cursor: crosshair;
 }
 
 #resetCropBtn {

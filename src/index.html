@@ -153,7 +153,7 @@
               <div class="section-head">
                 <div>
                   <p class="eyebrow">Kütüphane</p>
-                  <h2>Klip oynatıcı</h2>
+                  <h2 id="libraryHeading">Klip oynatıcı</h2>
                 </div>
                 <button id="refreshClipsBtn" class="secondary">Yenile</button>
               </div>
@@ -194,12 +194,13 @@
               <div class="section-head">
                 <div>
                   <p class="eyebrow">Editör</p>
-                  <h2>Klip kırp</h2>
+                  <h2 id="editorHeading">Klip kırp</h2>
                 </div>
                 <button id="exportTrimBtn" class="primary">Kes ve kaydet</button>
               </div>
               <div class="player-pane editor-player">
                 <video id="editorPlayer" controls preload="auto"></video>
+                <canvas id="imageEditorCanvas"></canvas>
                 <div id="cropLayer" class="crop-layer">
                   <div id="cropBox" class="crop-box">
                     <span class="crop-handle nw" data-handle="nw"></span>
@@ -212,11 +213,15 @@
               </div>
             </section>
             <aside class="editor-tools">
+              <div class="rail-toggle editor-mode-toggle">
+                <button id="editorClipsModeBtn" class="mode-chip active" type="button">Klip</button>
+                <button id="editorShotsModeBtn" class="mode-chip" type="button">Resim</button>
+              </div>
               <label class="field">
-                <span>Klip</span>
+                <span id="editorSourceLabel">Klip</span>
                 <select id="editorClipSelect"></select>
               </label>
-              <div class="range-fields">
+              <div id="videoTrimTools" class="range-fields">
                 <label class="field">
                   <span>Başlangıç sn</span>
                   <input id="trimStartInput" type="number" min="0" step="0.1" value="0" />
@@ -226,12 +231,30 @@
                   <input id="trimEndInput" type="number" min="0" step="0.1" value="0" />
                 </label>
               </div>
-              <div class="tool-row">
+              <div id="markTools" class="tool-row">
                 <button id="markStartBtn" class="secondary">Başlangıç işaretle</button>
                 <button id="markEndBtn" class="secondary">Bitiş işaretle</button>
               </div>
               <button id="resetCropBtn" class="secondary wide">Kırpma alanını sıfırla</button>
               <p id="editorNote" class="note">Köşelerden tutup görüntü alanını ayarla, sonra kaydet.</p>
+              <div id="imagePaintTools" class="image-paint-tools hidden">
+                <div class="tool-row three">
+                  <button id="cropToolBtn" class="secondary active" type="button">Kırp</button>
+                  <button id="brushToolBtn" class="secondary" type="button">Boya</button>
+                  <button id="eraserToolBtn" class="secondary" type="button">Silgi</button>
+                </div>
+                <div class="paint-grid">
+                  <label class="field">
+                    <span>Renk</span>
+                    <input id="brushColorInput" type="color" value="#f1c84b" />
+                  </label>
+                  <label class="field">
+                    <span>Kalem</span>
+                    <input id="brushSizeInput" type="range" min="2" max="60" value="8" />
+                  </label>
+                </div>
+                <button id="clearPaintBtn" class="secondary wide" type="button">Boyamayı temizle</button>
+              </div>
             </aside>
           </div>
         </section>
@@ -241,3 +264,4 @@
     <script src="./renderer.js"></script>
   </body>
 </html>
+

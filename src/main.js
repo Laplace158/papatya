@@ -638,11 +638,11 @@ function buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern 
   const inputArgs = backend === 'dda'
     ? [
         '-f', 'lavfi',
-        '-i', `ddagrab=framerate=${fps}:draw_mouse=1:output_idx=0:output_fmt=8bit:allow_fallback=1`
+        '-i', `ddagrab=framerate=${fps}:draw_mouse=0:output_idx=0:output_fmt=8bit:allow_fallback=1`
       ]
     : [
         '-f', 'gdigrab',
-        '-draw_mouse', '1',
+        '-draw_mouse', '0',
         '-framerate', String(fps),
         '-i', 'desktop',
         '-vf', `scale=${quality.width}:${quality.height}:force_original_aspect_ratio=decrease,pad=${quality.width}:${quality.height}:(ow-iw)/2:(oh-ih)/2`
@@ -1276,6 +1276,46 @@ async function renameClip(payload) {
   return { filePath: outputPath, clips: await listClips() };
 }
 
+async function renameScreenshot(payload) {
+  const inputPath = path.resolve(payload.shotPath);
+  if (!isInsideScreenshotDir(inputPath) || !fsSync.existsSync(inputPath)) {
+    throw new Error('Invalid screenshot path');
+  }
+
+  const rawName = String(payload.name || '').replace(/\.(png|jpe?g|webp)$/i, '');
+  const nextName = sanitizeFilePart(rawName);
+  const ext = path.extname(inputPath).toLowerCase() || '.png';
+  const outputPath = path.join(paths.screenshots(), `${nextName}${ext}`);
+  if (!isInsideScreenshotDir(outputPath)) throw new Error('Invalid screenshot name');
+
+  if (outputPath.toLowerCase() !== inputPath.toLowerCase() && fsSync.existsSync(outputPath)) {
+    throw new Error('Bu isim zaten var');
+  }
+
+  if (outputPath !== inputPath) await fs.rename(inputPath, outputPath);
+  return { filePath: outputPath, screenshots: await listScreenshots() };
+}
+
+async function saveEditedScreenshot(payload) {
+  await fs.mkdir(paths.screenshots(), { recursive: true });
+  const sourcePath = payload.shotPath ? path.resolve(payload.shotPath) : null;
+  if (sourcePath && (!isInsideScreenshotDir(sourcePath) || !fsSync.existsSync(sourcePath))) {
+    throw new Error('Invalid screenshot path');
+  }
+
+  const match = String(payload.dataUrl || '').match(/^data:image\/png;base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) throw new Error('Invalid image data');
+
+  const buffer = Buffer.from(match[1], 'base64');
+  if (!buffer.length || buffer.length > 60 * 1024 * 1024) throw new Error('Invalid image size');
+
+  const baseName = sourcePath ? path.parse(sourcePath).name : APP_NAME;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const outputPath = path.join(paths.screenshots(), `${sanitizeFilePart(baseName)}-duzenle-${stamp}.png`);
+  await fs.writeFile(outputPath, buffer);
+  return { filePath: outputPath, screenshots: await listScreenshots() };
+}
+
 async function stripClipAudio(payload) {
   const inputPath = path.resolve(payload.clipPath);
   if (!isInsideClipDir(inputPath) || !fsSync.existsSync(inputPath)) {
@@ -1477,6 +1517,14 @@ function setupIpc() {
     shell.showItemInFolder(resolved);
     return true;
   });
+  ipcMain.handle('screenshot:delete', async (_event, shotPath) => {
+    const resolved = path.resolve(shotPath);
+    if (!isInsideScreenshotDir(resolved)) throw new Error('Invalid screenshot path');
+    await fs.rm(resolved, { force: true });
+    return listScreenshots();
+  });
+  ipcMain.handle('screenshot:rename', (_event, payload) => renameScreenshot(payload));
+  ipcMain.handle('screenshot:save-edited', (_event, payload) => saveEditedScreenshot(payload));
   ipcMain.handle('audio:list-apps', listAudioApps);
   ipcMain.handle('sound:list', () => listNotificationSounds());
   ipcMain.handle('sound:add', addNotificationSound);
