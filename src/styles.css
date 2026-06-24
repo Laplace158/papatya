@@ -389,6 +389,19 @@ video {
   height: 100%;
   object-fit: contain;
   background: #04070c;
+  cursor: zoom-in;
+  transform-origin: center center;
+  user-select: none;
+  -webkit-user-drag: none;
+  will-change: transform;
+}
+
+#shotPlayer.zoomed {
+  cursor: grab;
+}
+
+#shotPlayer.dragging {
+  cursor: grabbing;
 }
 
 #clipPlayer.hidden-media,

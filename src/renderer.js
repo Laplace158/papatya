@@ -30,6 +30,16 @@ const state = {
   selectedClip: null,
   selectedShot: null,
   libraryMode: 'clips',
+  shotPreview: {
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    dragging: false,
+    dragStartX: 0,
+    dragStartY: 0,
+    startPanX: 0,
+    startPanY: 0
+  },
   editorMode: 'clips',
   editorClip: null,
   editorShot: null,
@@ -137,12 +147,118 @@ function loadClipIntoPlayer(player, clip) {
   player.load();
 }
 
+function shotPreviewBounds() {
+  const shot = $('shotPlayer');
+  const pane = shot?.parentElement;
+  if (!shot || !pane) return { maxX: 0, maxY: 0 };
+
+  const paneRect = pane.getBoundingClientRect();
+  const imageWidth = shot.naturalWidth || paneRect.width || 1;
+  const imageHeight = shot.naturalHeight || paneRect.height || 1;
+  const paneRatio = paneRect.width / paneRect.height;
+  const imageRatio = imageWidth / imageHeight;
+  let baseWidth = paneRect.width;
+  let baseHeight = paneRect.height;
+
+  if (paneRatio > imageRatio) {
+    baseWidth = baseHeight * imageRatio;
+  } else {
+    baseHeight = baseWidth / imageRatio;
+  }
+
+  return {
+    maxX: Math.max(0, (baseWidth * state.shotPreview.zoom - paneRect.width) / 2),
+    maxY: Math.max(0, (baseHeight * state.shotPreview.zoom - paneRect.height) / 2)
+  };
+}
+
+function clampShotPreviewPan() {
+  const bounds = shotPreviewBounds();
+  state.shotPreview.panX = Math.max(-bounds.maxX, Math.min(bounds.maxX, state.shotPreview.panX));
+  state.shotPreview.panY = Math.max(-bounds.maxY, Math.min(bounds.maxY, state.shotPreview.panY));
+}
+
+function applyShotPreviewTransform() {
+  const shot = $('shotPlayer');
+  if (!shot) return;
+  clampShotPreviewPan();
+  const { zoom, panX, panY } = state.shotPreview;
+  shot.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+  shot.classList.toggle('zoomed', zoom > 1.01);
+}
+
+function resetShotPreviewTransform() {
+  state.shotPreview.zoom = 1;
+  state.shotPreview.panX = 0;
+  state.shotPreview.panY = 0;
+  state.shotPreview.dragging = false;
+  $('shotPlayer')?.classList.remove('dragging');
+  applyShotPreviewTransform();
+}
+
+function zoomShotPreview(event) {
+  if (state.libraryMode !== 'screenshots' || !state.selectedShot) return;
+  const shot = $('shotPlayer');
+  const pane = shot?.parentElement;
+  if (!shot || !pane || shot.style.display === 'none') return;
+
+  event.preventDefault();
+  const rect = pane.getBoundingClientRect();
+  const cursorX = event.clientX - rect.left - rect.width / 2;
+  const cursorY = event.clientY - rect.top - rect.height / 2;
+  const oldZoom = state.shotPreview.zoom;
+  const step = event.deltaY < 0 ? 1.16 : 0.86;
+  const nextZoom = Math.max(1, Math.min(6, oldZoom * step));
+
+  if (nextZoom <= 1.01) {
+    state.shotPreview.zoom = 1;
+    state.shotPreview.panX = 0;
+    state.shotPreview.panY = 0;
+    applyShotPreviewTransform();
+    return;
+  }
+
+  const imageX = (cursorX - state.shotPreview.panX) / oldZoom;
+  const imageY = (cursorY - state.shotPreview.panY) / oldZoom;
+  state.shotPreview.zoom = nextZoom;
+  state.shotPreview.panX = cursorX - imageX * nextZoom;
+  state.shotPreview.panY = cursorY - imageY * nextZoom;
+  applyShotPreviewTransform();
+}
+
+function beginShotPreviewPan(event) {
+  if (event.button !== 0 || state.libraryMode !== 'screenshots' || state.shotPreview.zoom <= 1.01) return;
+  state.shotPreview.dragging = true;
+  state.shotPreview.dragStartX = event.clientX;
+  state.shotPreview.dragStartY = event.clientY;
+  state.shotPreview.startPanX = state.shotPreview.panX;
+  state.shotPreview.startPanY = state.shotPreview.panY;
+  $('shotPlayer')?.classList.add('dragging');
+  event.currentTarget.setPointerCapture?.(event.pointerId);
+  event.preventDefault();
+}
+
+function moveShotPreviewPan(event) {
+  if (!state.shotPreview.dragging) return;
+  state.shotPreview.panX = state.shotPreview.startPanX + event.clientX - state.shotPreview.dragStartX;
+  state.shotPreview.panY = state.shotPreview.startPanY + event.clientY - state.shotPreview.dragStartY;
+  applyShotPreviewTransform();
+}
+
+function endShotPreviewPan(event) {
+  if (!state.shotPreview.dragging) return;
+  state.shotPreview.dragging = false;
+  $('shotPlayer')?.classList.remove('dragging');
+  event?.currentTarget?.releasePointerCapture?.(event.pointerId);
+}
+
 function hideShotPreview() {
   const shot = $('shotPlayer');
   const video = $('clipPlayer');
   if (!shot) return;
   shot.style.display = 'none';
   shot.removeAttribute('src');
+  resetShotPreviewTransform();
   video?.classList.remove('hidden-media');
 }
 
@@ -154,8 +270,10 @@ function showShotPreview(item) {
   video.removeAttribute('src');
   video.load();
   video.classList.add('hidden-media');
+  shot.onload = () => applyShotPreviewTransform();
   shot.src = item.url;
   shot.style.display = 'block';
+  resetShotPreviewTransform();
 }
 
 function tryFallbackClipUrl(player, clip) {
@@ -1750,7 +1868,15 @@ function bindUi() {
     $('editorNote').textContent = 'Video acilamadi. Klip dosyasi bozuk ya da henuz tamamlanmamis olabilir.';
     toast('Video acilamadi.');
   });
-  window.addEventListener('resize', drawCropBox);
+  $('shotPlayer').addEventListener('wheel', zoomShotPreview, { passive: false });
+  $('shotPlayer').addEventListener('pointerdown', beginShotPreviewPan);
+  $('shotPlayer').addEventListener('pointermove', moveShotPreviewPan);
+  $('shotPlayer').addEventListener('pointerup', endShotPreviewPan);
+  $('shotPlayer').addEventListener('pointercancel', endShotPreviewPan);
+  window.addEventListener('resize', () => {
+    drawCropBox();
+    applyShotPreviewTransform();
+  });
   bindPlayerUi();
 }
 
