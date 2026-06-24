@@ -35,6 +35,7 @@ const state = {
   editorShot: null,
   imageEditor: {
     image: null,
+    paintCanvas: null,
     painting: false,
     tool: 'crop',
     lastPoint: null,
@@ -815,7 +816,7 @@ async function startRecorderInner() {
 async function switchCompatToGpu(error) {
   debugLog('compat-failed-switch-gpu', { message: error.message });
   state.captureReady = false;
-  state.settings = await window.clipforge.saveSettings({ ...state.settings, encoderMode: 'gpu', captureBackend: 'gdigrab' });
+  state.settings = await window.clipforge.saveSettings({ ...state.settings, encoderMode: 'gpu', captureBackend: 'dda' });
   $('encoderInput').value = 'gpu';
   updateStats();
   $('settingsNote').textContent = 'Uyumluluk modu acilmadi. GPU kayda gecildi.';
@@ -1101,6 +1102,7 @@ function clearImageEditor() {
   ctx?.clearRect(0, 0, canvas.width, canvas.height);
   canvas.classList.remove('active', 'painting');
   state.imageEditor.image = null;
+  state.imageEditor.paintCanvas = null;
   state.imageEditor.painting = false;
   state.imageEditor.lastPoint = null;
 }
@@ -1115,15 +1117,29 @@ function setImageTool(tool) {
   $('imageEditorCanvas')?.classList.toggle('painting', isPaint);
 }
 
-function drawImageEditorBase() {
+function renderImageEditor() {
   const canvas = $('imageEditorCanvas');
   const image = state.imageEditor.image;
   if (!canvas || !image) return;
   const ctx = canvas.getContext('2d');
-  canvas.width = image.naturalWidth || image.width;
-  canvas.height = image.naturalHeight || image.height;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  if (state.imageEditor.paintCanvas) {
+    ctx.drawImage(state.imageEditor.paintCanvas, 0, 0);
+  }
+}
+
+function resetImageEditorLayers() {
+  const canvas = $('imageEditorCanvas');
+  const image = state.imageEditor.image;
+  if (!canvas || !image) return;
+  canvas.width = image.naturalWidth || image.width;
+  canvas.height = image.naturalHeight || image.height;
+  const paintCanvas = document.createElement('canvas');
+  paintCanvas.width = canvas.width;
+  paintCanvas.height = canvas.height;
+  state.imageEditor.paintCanvas = paintCanvas;
+  renderImageEditor();
   requestAnimationFrame(drawCropBox);
 }
 
@@ -1142,7 +1158,7 @@ function setEditorShot(shot) {
   const image = new Image();
   image.onload = () => {
     state.imageEditor.image = image;
-    drawImageEditorBase();
+    resetImageEditorLayers();
     $('emptyEditor').classList.add('hidden');
     $('editorNote').textContent = shot.name;
     resetCrop();
@@ -1168,9 +1184,9 @@ function getCanvasMediaPoint(event) {
 }
 
 function paintImageLine(from, to) {
-  const canvas = $('imageEditorCanvas');
-  if (!canvas || !from || !to) return;
-  const ctx = canvas.getContext('2d');
+  const paintCanvas = state.imageEditor.paintCanvas;
+  if (!paintCanvas || !from || !to) return;
+  const ctx = paintCanvas.getContext('2d');
   ctx.save();
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
@@ -1186,6 +1202,7 @@ function paintImageLine(from, to) {
   ctx.lineTo(to.x, to.y);
   ctx.stroke();
   ctx.restore();
+  renderImageEditor();
 }
 
 function beginImagePaint(event) {
@@ -1213,7 +1230,11 @@ function endImagePaint() {
 
 function clearImagePaint() {
   if (!state.imageEditor.image) return;
-  drawImageEditorBase();
+  const paintCanvas = state.imageEditor.paintCanvas;
+  if (paintCanvas) {
+    paintCanvas.getContext('2d').clearRect(0, 0, paintCanvas.width, paintCanvas.height);
+  }
+  renderImageEditor();
   toast('Boyama temizlendi.');
 }
 

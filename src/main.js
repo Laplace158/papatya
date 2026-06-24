@@ -45,7 +45,7 @@ const DEFAULT_SETTINGS = {
   quality: '720',
   fps: 60,
   encoderMode: 'gpu',
-  captureBackend: 'gdigrab',
+  captureBackend: 'dda',
   includeAudio: true,
   includeMic: false,
   micDeviceId: 'default',
@@ -165,6 +165,7 @@ async function saveSettings(next) {
 function normalizeSettings(next) {
   const normalizedHotkey = normalizeHotkey(next.hotkey);
   const normalizedScreenshotHotkey = normalizeHotkey(next.screenshotHotkey || DEFAULT_SETTINGS.screenshotHotkey);
+  const normalizedCaptureBackend = 'dda';
   const notificationSounds = Array.isArray(next.notificationSounds)
     ? next.notificationSounds
         .filter((sound) => sound && sound.id && sound.path)
@@ -184,6 +185,7 @@ function normalizeSettings(next) {
     ...next,
     hotkey: normalizedHotkey,
     screenshotHotkey: normalizedScreenshotHotkey,
+    captureBackend: normalizedCaptureBackend,
     notificationSoundId,
     notificationSounds
   };
@@ -630,28 +632,15 @@ async function resetSystemAudioBuffer() {
 }
 
 function chooseGpuBackend(qualityKey, requestedBackend = 'auto') {
-  if (requestedBackend === 'dda' || requestedBackend === 'gdigrab') return requestedBackend;
-  return 'gdigrab';
+  return 'dda';
 }
 
 function buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern }) {
-  const inputArgs = backend === 'dda'
-    ? [
-        '-f', 'lavfi',
-        '-i', `ddagrab=framerate=${fps}:draw_mouse=0:output_idx=0:output_fmt=8bit:allow_fallback=1`
-      ]
-    : [
-        '-f', 'gdigrab',
-        '-draw_mouse', '0',
-        '-framerate', String(fps),
-        '-i', 'desktop',
-        '-vf', `scale=${quality.width}:${quality.height}:force_original_aspect_ratio=decrease,pad=${quality.width}:${quality.height}:(ow-iw)/2:(oh-ih)/2`
-      ];
-
   return [
     '-hide_banner',
     '-loglevel', 'warning',
-    ...inputArgs,
+    '-f', 'lavfi',
+    '-i', `ddagrab=framerate=${fps}:draw_mouse=0:output_idx=0:output_fmt=8bit:allow_fallback=1`,
     '-an',
     '-c:v', 'h264_nvenc',
     '-preset', 'p1',
@@ -895,14 +884,6 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
     gpuState.stopping = false;
     if (gpuState.process === child) gpuState.process = null;
     logLine('gpu', 'close', { code, intentionalStop, backend: child.captureBackend, stderr: stderr.trim().slice(-400) });
-    if (!intentionalStop && code !== 0 && child.captureBackend === 'dda') {
-      startGpuCapture(settings, 'gdigrab').catch((error) => {
-        if (mainWindow) {
-          mainWindow.webContents.send('gpu-status', { ok: false, message: error.message });
-        }
-      });
-      return;
-    }
     if (!intentionalStop && code !== 0 && mainWindow) {
       mainWindow.webContents.send('gpu-status', { ok: false, message: stderr.trim() || `NVENC exited with code ${code}` });
     }
@@ -916,16 +897,10 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
     const segments = await scanGpuSegments().catch(() => []);
     if (segments.length > 0) return;
     logLine('gpu', 'no-segments-watchdog', { backend, quality: qualityKey, fps });
-    if (backend === 'dda') {
-      await startGpuCapture(settings, 'gdigrab').catch((error) => {
-        if (mainWindow) mainWindow.webContents.send('gpu-status', { ok: false, message: error.message });
-      });
-      return;
-    }
     if (mainWindow) {
       mainWindow.webContents.send('gpu-status', {
         ok: false,
-        message: 'FFmpeg video buffer olusmadi. Ekran yakalama bu bilgisayarda baslamadi.'
+        message: 'DDA video buffer olusmadi. GDI kapali, imlec titremesini onlemek icin uyumluluk modunu dene.'
       });
     }
   }, GPU_SEGMENT_MS + 3500);

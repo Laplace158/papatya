@@ -1,7 +1,7 @@
 {
   "name": "papatya",
-  "version": "1.0.10",
-  "description": "A lightweight Papatya background clip recorder.",
+  "version": "1.0.11",
+  "description": "Papatya",
   "main": "src/main.js",
   "scripts": {
     "start": "node scripts/start-electron.js",
