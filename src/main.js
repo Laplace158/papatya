@@ -8,6 +8,10 @@ const { autoUpdater } = require('electron-updater');
 const ffmpegStaticPath = require('ffmpeg-static');
 const fixWebmDuration = require('webm-duration-fix').default;
 
+app.disableHardwareAcceleration();
+app.commandLine.appendSwitch('disable-gpu-compositing');
+app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion');
+
 function resolveExecutablePath(rawPath) {
   if (!rawPath) return rawPath;
   const unpackedPath = String(rawPath).replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
