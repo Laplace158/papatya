@@ -159,6 +159,7 @@
               </div>
               <div class="player-pane">
                 <video id="clipPlayer" controls preload="auto"></video>
+                <img id="shotPlayer" alt="" />
                 <div id="emptyPlayer" class="empty-player">Sağdaki listeden klibe tek tıkla</div>
               </div>
               <div class="clip-meta-row">
@@ -173,8 +174,14 @@
             </section>
             <aside class="clip-rail">
               <div class="rail-head">
-                <strong>Klipler</strong>
-                <small>Tek tık oynat, çift tık klasör</small>
+                <div class="rail-title-row">
+                  <strong id="libraryTypeLabel">Klipler</strong>
+                  <div class="rail-toggle">
+                    <button id="clipsModeBtn" class="mode-chip active" type="button">Klipler</button>
+                    <button id="shotsModeBtn" class="mode-chip" type="button">Resimler</button>
+                  </div>
+                </div>
+                <small id="libraryHint">Tek tık oynat, çift tık klasör</small>
               </div>
               <div id="clipGrid" class="clip-list"></div>
             </aside>

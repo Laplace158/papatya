@@ -5,25 +5,43 @@ const fsSync = require('fs');
 const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
 const { autoUpdater } = require('electron-updater');
-const ffmpegPath = require('ffmpeg-static');
+const ffmpegStaticPath = require('ffmpeg-static');
 const fixWebmDuration = require('webm-duration-fix').default;
 
+function resolveExecutablePath(rawPath) {
+  if (!rawPath) return rawPath;
+  const unpackedPath = String(rawPath).replace(`${path.sep}app.asar${path.sep}`, `${path.sep}app.asar.unpacked${path.sep}`);
+  return fsSync.existsSync(unpackedPath) ? unpackedPath : rawPath;
+}
+
+const ffmpegPath = resolveExecutablePath(ffmpegStaticPath);
+
 const APP_NAME = 'Papatya';
+const SYSTEM_MUX_VOLUME = '1.0';
+const MIC_MUX_VOLUME = '0.10';
+const CLIP_AUDIO_FILTER = [
+  'aresample=async=1000:first_pts=0',
+  'alimiter=limit=0.99:attack=5:release=50',
+  'apad'
+].join(',');
 const QUALITY = {
   480: { width: 854, height: 480, bitrate: '1200k' },
   720: { width: 1280, height: 720, bitrate: '3000k' },
   1080: { width: 1920, height: 1080, bitrate: '6000k' },
   '2k': { width: 2560, height: 1440, bitrate: '10000k' }
 };
-const GPU_SEGMENT_SECONDS = 5;
+const GPU_SEGMENT_SECONDS = 2;
 const GPU_SEGMENT_MS = GPU_SEGMENT_SECONDS * 1000;
+const SYSTEM_AUDIO_SEGMENT_SECONDS = 1;
+const SYSTEM_AUDIO_SEGMENT_MS = SYSTEM_AUDIO_SEGMENT_SECONDS * 1000;
 const DEFAULT_SETTINGS = {
   hotkey: 'F8',
+  screenshotHotkey: 'F9',
   clipSeconds: 30,
   quality: '720',
   fps: 60,
   encoderMode: 'gpu',
-  captureBackend: 'auto',
+  captureBackend: 'gdigrab',
   includeAudio: true,
   includeMic: false,
   micDeviceId: 'default',
@@ -36,6 +54,7 @@ let mainWindow;
 let overlayWindow;
 let tray;
 let isQuitting = false;
+let quitInFlight = false;
 let settings = { ...DEFAULT_SETTINGS };
 let bufferState = {
   sessionId: Date.now(),
@@ -48,24 +67,53 @@ let gpuState = {
   stopping: false,
   segments: []
 };
+let systemAudioState = {
+  sessionId: Date.now(),
+  process: null,
+  scanner: null,
+  stopping: false,
+  segments: []
+};
 let updateCheckTimer = null;
 
 const paths = {
   userData: () => app.getPath('userData'),
   settings: () => path.join(app.getPath('userData'), 'settings.json'),
+  log: () => path.join(app.getPath('userData'), 'papatya.log'),
   clips: () => path.join(app.getPath('videos'), 'Papatya Clips'),
+  screenshots: () => path.join(app.getPath('pictures'), 'Papatya Screenshots'),
   legacyClips: () => path.join(app.getPath('videos'), 'ClipForge Clips'),
   buffer: () => path.join(app.getPath('userData'), 'rolling-buffer'),
   gpuBuffer: () => path.join(app.getPath('userData'), 'gpu-buffer'),
+  systemAudioBuffer: () => path.join(app.getPath('userData'), 'system-audio-buffer'),
+  systemAudioHelper: () => {
+    const userTool = path.join(app.getPath('userData'), 'tools', 'audio-loopback', 'PapatyaAudioLoopback.exe');
+    if (fsSync.existsSync(userTool)) return userTool;
+    const bundled = path.join(__dirname, '..', 'assets', 'audio-loopback', 'PapatyaAudioLoopback.exe');
+    return resolveExecutablePath(bundled);
+  },
   defaultSound: () => path.join(__dirname, '..', 'assets', 'clip-sound.mp3'),
   icon: () => path.join(__dirname, '..', 'assets', 'papatya.ico')
 };
 
+function logLine(scope, message, extra = null) {
+  const stamp = new Date().toISOString();
+  const suffix = extra == null
+    ? ''
+    : ` ${typeof extra === 'string' ? extra : JSON.stringify(extra)}`;
+  const line = `[${stamp}] [${scope}] ${message}${suffix}\n`;
+  fs.appendFile(paths.log(), line).catch(() => {});
+}
+
 async function ensureDirs() {
   await fs.mkdir(paths.userData(), { recursive: true });
   await fs.mkdir(paths.clips(), { recursive: true });
+  await fs.mkdir(paths.screenshots(), { recursive: true });
   await fs.mkdir(paths.buffer(), { recursive: true });
   await fs.mkdir(paths.gpuBuffer(), { recursive: true });
+  await fs.mkdir(paths.systemAudioBuffer(), { recursive: true });
+  await fs.writeFile(paths.log(), '', { flag: 'a' });
+  logLine('app', 'directories-ready', { userData: paths.userData(), clips: paths.clips() });
   await migrateLegacyClips();
 }
 
@@ -96,11 +144,23 @@ async function loadSettings() {
 async function saveSettings(next) {
   settings = normalizeSettings({ ...settings, ...next });
   await fs.writeFile(paths.settings(), JSON.stringify(settings, null, 2));
+  logLine('settings', 'saved', {
+    hotkey: settings.hotkey,
+    screenshotHotkey: settings.screenshotHotkey,
+    clipSeconds: settings.clipSeconds,
+    quality: settings.quality,
+    fps: settings.fps,
+    encoderMode: settings.encoderMode,
+    includeAudio: settings.includeAudio,
+    includeMic: settings.includeMic
+  });
   registerHotkey();
   return settings;
 }
 
 function normalizeSettings(next) {
+  const normalizedHotkey = normalizeHotkey(next.hotkey);
+  const normalizedScreenshotHotkey = normalizeHotkey(next.screenshotHotkey || DEFAULT_SETTINGS.screenshotHotkey);
   const notificationSounds = Array.isArray(next.notificationSounds)
     ? next.notificationSounds
         .filter((sound) => sound && sound.id && sound.path)
@@ -118,9 +178,19 @@ function normalizeSettings(next) {
 
   return {
     ...next,
+    hotkey: normalizedHotkey,
+    screenshotHotkey: normalizedScreenshotHotkey,
     notificationSoundId,
     notificationSounds
   };
+}
+
+function normalizeHotkey(value) {
+  const hotkey = String(value || '').trim();
+  if (!hotkey) return DEFAULT_SETTINGS.hotkey;
+  if (/^F([1-9]|1[0-2])$/i.test(hotkey)) return hotkey.toUpperCase();
+  if (/^(CommandOrControl|Ctrl|Alt|Shift)(\+[A-Z0-9])+$/.test(hotkey)) return hotkey;
+  return DEFAULT_SETTINGS.hotkey;
 }
 
 function listNotificationSounds() {
@@ -218,12 +288,12 @@ function createTray() {
     Menu.buildFromTemplate([
       { label: 'Papatya Aç', click: showWindow },
       { label: `Save Clip (${settings.hotkey})`, click: () => triggerClipSave() },
+      { label: `Screenshot (${settings.screenshotHotkey})`, click: () => captureScreenshot() },
       { type: 'separator' },
       {
         label: 'Quit',
         click: () => {
-          isQuitting = true;
-          app.quit();
+          requestQuit();
         }
       }
     ])
@@ -233,6 +303,10 @@ function createTray() {
 }
 
 function createOverlayWindow() {
+  if (overlayWindow && !overlayWindow.isDestroyed()) {
+    return overlayWindow;
+  }
+
   overlayWindow = new BrowserWindow({
     width: 300,
     height: 74,
@@ -258,10 +332,14 @@ function createOverlayWindow() {
   overlayWindow.setIgnoreMouseEvents(true);
   overlayWindow.setAlwaysOnTop(true, 'screen-saver');
   overlayWindow.loadFile(path.join(__dirname, 'overlay.html'));
+  overlayWindow.on('closed', () => {
+    overlayWindow = null;
+  });
+  return overlayWindow;
 }
 
-function showClipOverlay() {
-  if (!overlayWindow) createOverlayWindow();
+function showClipOverlay(title = 'Klip alindi', detail = 'Papatya kaydetti') {
+  if (!overlayWindow || overlayWindow.isDestroyed()) createOverlayWindow();
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
   const soundUrl = pathToFileURL(selectedNotificationSoundPath()).href;
   overlayWindow.setBounds({
@@ -273,6 +351,10 @@ function showClipOverlay() {
   overlayWindow.showInactive();
   overlayWindow.webContents.executeJavaScript(`
     (() => {
+      const title = document.querySelector('.toast strong');
+      const detail = document.querySelector('.toast span');
+      if (title) title.textContent = ${JSON.stringify(title)};
+      if (detail) detail.textContent = ${JSON.stringify(detail)};
       const audio = document.getElementById('tinkSound');
       if (audio) {
         const source = ${JSON.stringify(soundUrl)};
@@ -284,10 +366,41 @@ function showClipOverlay() {
     })();
   `).catch(() => {});
   clearTimeout(showClipOverlay.hideTimer);
-  showClipOverlay.hideTimer = setTimeout(() => overlayWindow?.hide(), 2200);
+  showClipOverlay.hideTimer = setTimeout(() => {
+    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+    overlayWindow.hide();
+    overlayWindow.close();
+  }, 2200);
+}
+
+async function requestQuit() {
+  if (quitInFlight) return;
+  quitInFlight = true;
+  isQuitting = true;
+  clearInterval(updateCheckTimer);
+  clearTimeout(showClipOverlay.hideTimer);
+  try {
+    await stopGpuCapture().catch(() => {});
+  } finally {
+    try {
+      if (tray) {
+        tray.destroy();
+        tray = null;
+      }
+      if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow.destroy();
+      if (mainWindow && !mainWindow.isDestroyed()) mainWindow.destroy();
+    } catch {}
+    globalShortcut.unregisterAll();
+    logLine('app', 'request-quit');
+    app.exit(0);
+  }
 }
 
 function createWindow() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    return mainWindow;
+  }
+
   mainWindow = new BrowserWindow({
     width: 1180,
     height: 760,
@@ -306,19 +419,38 @@ function createWindow() {
     }
   });
 
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
-  mainWindow.once('ready-to-show', () => mainWindow.show());
+  const windowRef = mainWindow;
+  windowRef.loadFile(path.join(__dirname, 'index.html'));
+  windowRef.once('ready-to-show', () => {
+    if (!windowRef.isDestroyed()) windowRef.show();
+  });
 
-  mainWindow.on('close', (event) => {
+  windowRef.on('close', (event) => {
     if (!isQuitting) {
       event.preventDefault();
-      mainWindow.hide();
+      if (!windowRef.isDestroyed()) windowRef.hide();
     }
   });
+
+  windowRef.on('closed', () => {
+    if (mainWindow === windowRef) {
+      mainWindow = null;
+    }
+  });
+
+  return windowRef;
+}
+
+function canUseWindow(windowRef) {
+  return Boolean(windowRef && !windowRef.isDestroyed());
 }
 
 function showWindow() {
-  if (!mainWindow) return;
+  if (!canUseWindow(mainWindow)) {
+    createWindow();
+  }
+  if (!canUseWindow(mainWindow)) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
   mainWindow.show();
   mainWindow.focus();
 }
@@ -326,14 +458,22 @@ function showWindow() {
 function registerHotkey() {
   if (!app.isReady()) return;
   globalShortcut.unregisterAll();
-  const ok = globalShortcut.register(settings.hotkey, () => triggerClipSave());
-  if (mainWindow) {
-    mainWindow.webContents.send('hotkey-status', { hotkey: settings.hotkey, registered: ok });
+  const clipOk = globalShortcut.register(settings.hotkey, () => triggerClipSave());
+  const screenshotOk = globalShortcut.register(settings.screenshotHotkey, () => captureScreenshot());
+  logLine('hotkey', clipOk ? 'registered' : 'register-failed', { hotkey: settings.hotkey, type: 'clip' });
+  logLine('hotkey', screenshotOk ? 'registered' : 'register-failed', { hotkey: settings.screenshotHotkey, type: 'screenshot' });
+  if (canUseWindow(mainWindow)) {
+    mainWindow.webContents.send('hotkey-status', {
+      hotkey: settings.hotkey,
+      screenshotHotkey: settings.screenshotHotkey,
+      registered: clipOk,
+      screenshotRegistered: screenshotOk
+    });
   }
 }
 
 function notifyUpdateStatus(payload) {
-  if (!mainWindow) return;
+  if (!canUseWindow(mainWindow)) return;
   mainWindow.webContents.send('update-status', payload);
 }
 
@@ -407,8 +547,41 @@ function setupAutoUpdates() {
 }
 
 function triggerClipSave() {
-  if (!mainWindow) return;
+  if (!canUseWindow(mainWindow)) return;
+  logLine('clip', 'save-requested', { hidden: !mainWindow.isVisible() });
   mainWindow.webContents.send('save-clip');
+}
+
+async function captureScreenshot() {
+  try {
+    await fs.mkdir(paths.screenshots(), { recursive: true });
+    const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+    const sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: {
+        width: Math.round(display.size.width * display.scaleFactor),
+        height: Math.round(display.size.height * display.scaleFactor)
+      }
+    });
+    const source = sources.find((item) => String(item.display_id || '') === String(display.id || '')) || sources[0];
+    if (!source || source.thumbnail.isEmpty()) throw new Error('Screen source unavailable');
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filePath = path.join(paths.screenshots(), `${APP_NAME}-${stamp}.png`);
+    await fs.writeFile(filePath, source.thumbnail.toPNG());
+    logLine('screenshot', 'saved', { filePath, hotkey: settings.screenshotHotkey });
+    showClipOverlay('Ekran goruntusu alindi', 'Papatya kaydetti');
+    if (canUseWindow(mainWindow)) {
+      mainWindow.webContents.send('screenshot-saved', { filePath });
+    }
+    return filePath;
+  } catch (error) {
+    logLine('screenshot', 'failed', { message: error.message });
+    if (canUseWindow(mainWindow)) {
+      mainWindow.webContents.send('screenshot-saved', { error: error.message });
+    }
+    throw error;
+  }
 }
 
 function sanitizeFilePart(value) {
@@ -432,6 +605,7 @@ async function resetBuffer() {
   };
   await fs.rm(paths.buffer(), { recursive: true, force: true });
   await fs.mkdir(paths.buffer(), { recursive: true });
+  logLine('buffer', 'reset', { sessionId: bufferState.sessionId });
   return true;
 }
 
@@ -440,11 +614,20 @@ async function resetGpuBuffer() {
   gpuState.segments = [];
   await fs.rm(paths.gpuBuffer(), { recursive: true, force: true });
   await fs.mkdir(paths.gpuBuffer(), { recursive: true });
+  logLine('gpu', 'buffer-reset', { sessionId: gpuState.sessionId });
+}
+
+async function resetSystemAudioBuffer() {
+  systemAudioState.sessionId = Date.now();
+  systemAudioState.segments = [];
+  await fs.rm(paths.systemAudioBuffer(), { recursive: true, force: true });
+  await fs.mkdir(paths.systemAudioBuffer(), { recursive: true });
+  logLine('system-audio', 'buffer-reset', { sessionId: systemAudioState.sessionId });
 }
 
 function chooseGpuBackend(qualityKey, requestedBackend = 'auto') {
   if (requestedBackend === 'dda' || requestedBackend === 'gdigrab') return requestedBackend;
-  return ['1080', '2k'].includes(qualityKey) ? 'dda' : 'gdigrab';
+  return 'gdigrab';
 }
 
 function buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern }) {
@@ -521,6 +704,121 @@ async function scanGpuSegments() {
   return gpuState.segments;
 }
 
+async function scanSystemAudioSegments() {
+  await fs.mkdir(paths.systemAudioBuffer(), { recursive: true });
+  const keepMs = (Number(settings.clipSeconds) + SYSTEM_AUDIO_SEGMENT_SECONDS * 8) * 1000;
+  const cutoff = Date.now() - keepMs;
+  const entries = await fs.readdir(paths.systemAudioBuffer(), { withFileTypes: true }).catch(() => []);
+  const segments = [];
+
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && entry.name.startsWith(`${systemAudioState.sessionId}-`) && entry.name.endsWith('.wav'))
+      .map(async (entry) => {
+        const filePath = path.join(paths.systemAudioBuffer(), entry.name);
+        const stat = await fs.stat(filePath).catch(() => null);
+        if (!stat) return;
+        if (stat.mtimeMs < cutoff) {
+          await fs.rm(filePath, { force: true }).catch(() => {});
+          return;
+        }
+        if (stat.size > 4096) {
+          segments.push({
+            path: filePath,
+            at: stat.mtimeMs,
+            startedAt: stat.mtimeMs - SYSTEM_AUDIO_SEGMENT_MS,
+            endedAt: stat.mtimeMs,
+            size: stat.size
+          });
+        }
+      })
+  );
+
+  systemAudioState.segments = segments.sort((a, b) => a.at - b.at);
+  return systemAudioState.segments;
+}
+
+function stopSystemAudioCapture() {
+  if (systemAudioState.scanner) {
+    clearInterval(systemAudioState.scanner);
+    systemAudioState.scanner = null;
+  }
+
+  const child = systemAudioState.process;
+  if (!child || child.killed) {
+    systemAudioState.process = null;
+    return Promise.resolve(true);
+  }
+
+  return new Promise((resolve) => {
+    const done = () => {
+      if (systemAudioState.process === child) systemAudioState.process = null;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      resolve(true);
+    };
+    const timer = setTimeout(done, 4000);
+    const killTimer = setTimeout(() => {
+      if (!child.killed) child.kill('SIGTERM');
+    }, 2500);
+    child.once('close', done);
+    systemAudioState.stopping = true;
+    try {
+      child.stdin.write('q\n');
+      child.stdin.end();
+    } catch {
+      child.kill('SIGTERM');
+    }
+  });
+}
+
+async function startSystemAudioCapture(nextSettings = {}) {
+  await stopSystemAudioCapture();
+  if (!nextSettings.includeAudio) {
+    logLine('system-audio', 'disabled');
+    return { ok: false, reason: 'disabled' };
+  }
+
+  const helperPath = paths.systemAudioHelper();
+  if (!fsSync.existsSync(helperPath)) {
+    logLine('system-audio', 'helper-missing', { helperPath });
+    return { ok: false, reason: 'helper-missing' };
+  }
+
+  await resetSystemAudioBuffer();
+  const keepSeconds = Number(settings.clipSeconds) + 10;
+  const args = [
+    paths.systemAudioBuffer(),
+    String(systemAudioState.sessionId),
+    String(SYSTEM_AUDIO_SEGMENT_MS),
+    String(keepSeconds)
+  ];
+  const child = spawn(helperPath, args, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  let stderr = '';
+  child.stdout.on('data', (data) => {
+    logLine('system-audio', 'helper', data.toString().trim().slice(-300));
+  });
+  child.stderr.on('data', (data) => {
+    stderr += data.toString();
+    if (stderr.length > 6000) stderr = stderr.slice(-3000);
+  });
+  child.on('error', (error) => {
+    logLine('system-audio', 'spawn-error', { message: error.message, helperPath });
+  });
+  child.on('close', (code) => {
+    const intentionalStop = systemAudioState.stopping;
+    systemAudioState.stopping = false;
+    if (systemAudioState.process === child) systemAudioState.process = null;
+    logLine('system-audio', 'close', { code, intentionalStop, stderr: stderr.trim().slice(-400) });
+  });
+
+  systemAudioState.process = child;
+  systemAudioState.scanner = setInterval(() => scanSystemAudioSegments().catch(() => {}), 1000);
+  setTimeout(() => scanSystemAudioSegments().catch(() => {}), 1400);
+  logLine('system-audio', 'start', { helperPath, sessionId: systemAudioState.sessionId });
+  return { ok: true };
+}
+
 function stopGpuCapture() {
   if (gpuState.scanner) {
     clearInterval(gpuState.scanner);
@@ -530,19 +828,32 @@ function stopGpuCapture() {
   const child = gpuState.process;
   if (!child || child.killed) {
     gpuState.process = null;
-    return Promise.resolve(true);
+    return stopSystemAudioCapture();
   }
 
   return new Promise((resolve) => {
     const done = () => {
       if (gpuState.process === child) gpuState.process = null;
       clearTimeout(timer);
-      resolve(true);
+      clearTimeout(killTimer);
+      stopSystemAudioCapture().finally(() => resolve(true));
     };
-    const timer = setTimeout(done, 1800);
+    const timer = setTimeout(done, 10000);
+    const killTimer = setTimeout(() => {
+      if (!child.killed) child.kill('SIGTERM');
+    }, 8000);
     child.once('close', done);
     gpuState.stopping = true;
-    child.kill('SIGTERM');
+    if (child.stdin && !child.stdin.destroyed) {
+      try {
+        child.stdin.write('q');
+        child.stdin.end();
+      } catch {
+        child.kill('SIGTERM');
+      }
+    } else {
+      child.kill('SIGTERM');
+    }
   });
 }
 
@@ -550,6 +861,7 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
   await stopGpuCapture();
   settings = { ...settings, ...nextSettings };
   await resetGpuBuffer();
+  await startSystemAudioCapture(settings);
 
   const qualityKey = String(settings.quality || '720').toLowerCase();
   const quality = QUALITY[qualityKey] || QUALITY[720];
@@ -559,10 +871,17 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
   const bufsize = maxrate;
   const backend = forcedBackend || chooseGpuBackend(qualityKey, settings.captureBackend);
   const args = buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern });
+  logLine('gpu', 'start', { backend, quality: qualityKey, fps, pattern });
 
   const child = spawn(ffmpegPath, args, { windowsHide: true });
   child.captureBackend = backend;
   let stderr = '';
+  child.on('error', (error) => {
+    logLine('gpu', 'spawn-error', { message: error.message, ffmpegPath });
+    if (mainWindow) {
+      mainWindow.webContents.send('gpu-status', { ok: false, message: `FFmpeg baslatilamadi: ${error.message}` });
+    }
+  });
   child.stderr.on('data', (data) => {
     stderr += data.toString();
     if (stderr.length > 6000) stderr = stderr.slice(-3000);
@@ -571,6 +890,7 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
     const intentionalStop = gpuState.stopping;
     gpuState.stopping = false;
     if (gpuState.process === child) gpuState.process = null;
+    logLine('gpu', 'close', { code, intentionalStop, backend: child.captureBackend, stderr: stderr.trim().slice(-400) });
     if (!intentionalStop && code !== 0 && child.captureBackend === 'dda') {
       startGpuCapture(settings, 'gdigrab').catch((error) => {
         if (mainWindow) {
@@ -587,6 +907,24 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
   gpuState.process = child;
   gpuState.scanner = setInterval(() => scanGpuSegments().catch(() => {}), 1500);
   setTimeout(() => scanGpuSegments().catch(() => {}), 1800);
+  setTimeout(async () => {
+    if (gpuState.process !== child || child.killed) return;
+    const segments = await scanGpuSegments().catch(() => []);
+    if (segments.length > 0) return;
+    logLine('gpu', 'no-segments-watchdog', { backend, quality: qualityKey, fps });
+    if (backend === 'dda') {
+      await startGpuCapture(settings, 'gdigrab').catch((error) => {
+        if (mainWindow) mainWindow.webContents.send('gpu-status', { ok: false, message: error.message });
+      });
+      return;
+    }
+    if (mainWindow) {
+      mainWindow.webContents.send('gpu-status', {
+        ok: false,
+        message: 'FFmpeg video buffer olusmadi. Ekran yakalama bu bilgisayarda baslamadi.'
+      });
+    }
+  }, GPU_SEGMENT_MS + 3500);
   return { ok: true, mode: 'gpu', backend };
 }
 
@@ -627,6 +965,7 @@ async function writeBufferChunk(payload) {
   };
   bufferState.chunks.push(chunk);
   await trimBuffer();
+  logLine('buffer', 'chunk-written', { id, count: bufferState.chunks.length, mimeType: chunk.mimeType });
   return {
     buffered: bufferState.chunks.length
   };
@@ -644,7 +983,10 @@ function runFfmpeg(args) {
     child.stderr.on('data', (data) => {
       stderr += data.toString();
     });
-    child.on('error', reject);
+    child.on('error', (error) => {
+      logLine('ffmpeg', 'spawn-error', { message: error.message, ffmpegPath, args });
+      reject(error);
+    });
     child.on('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
@@ -685,6 +1027,7 @@ async function saveBufferClip(payload) {
   const listPath = path.join(paths.buffer(), `${bufferState.sessionId}-concat.txt`);
   await fs.writeFile(listPath, segmentPaths.map(concatListLine).join('\n'));
   await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', filePath]);
+  logLine('clip', 'buffer-saved', { filePath, segments: segmentPaths.length });
   showClipOverlay();
   return { filePath, clips: await listClips() };
 }
@@ -716,6 +1059,7 @@ function syncOffsetSeconds(audioStartAt, videoStartAt) {
 async function saveGpuClip(payload) {
   await stopGpuCapture();
   await scanGpuSegments();
+  await scanSystemAudioSegments();
   await fs.mkdir(paths.clips(), { recursive: true });
   const requestedAt = Number(payload.requestedAt) || Date.now();
   const cutoff = requestedAt - Number(settings.clipSeconds) * 1000;
@@ -731,44 +1075,100 @@ async function saveGpuClip(payload) {
   const tempVideoPath = path.join(paths.gpuBuffer(), `${gpuState.sessionId}-video-${stamp}.mp4`);
   await concatFiles(videoSegments.map((segment) => segment.path), tempVideoPath);
 
-  const audioEntries = bufferState.chunks
+  const systemAudioEntries = systemAudioState.segments
+    .filter((segment) => segment.endedAt >= cutoff && streamStartMs(segment) <= requestedAt)
+    .sort((a, b) => a.at - b.at)
+    .filter((segment) => fsSync.existsSync(segment.path));
+  const systemAudioChunks = systemAudioEntries.map((segment) => segment.path);
+
+  const micAudioEntries = bufferState.chunks
     .filter((chunk) => chunk.endedAt >= cutoff && streamStartMs(chunk) <= requestedAt)
     .sort((a, b) => a.at - b.at)
     .filter((chunk) => fsSync.existsSync(bufferFilePath(chunk.id)));
-  const audioChunks = audioEntries.map((chunk) => bufferFilePath(chunk.id));
+  const micAudioChunks = micAudioEntries.map((chunk) => bufferFilePath(chunk.id));
+  const audioChunks = systemAudioChunks.length ? systemAudioChunks : micAudioChunks;
 
-  if (!audioChunks.length) {
+  if (!systemAudioChunks.length && !micAudioChunks.length) {
     await fs.copyFile(tempVideoPath, filePath);
   } else {
-    const tempAudioPath = path.join(paths.buffer(), `${bufferState.sessionId}-audio-${stamp}.webm`);
-    await concatFiles(audioChunks, tempAudioPath);
+    const tempSystemAudioPath = systemAudioChunks.length
+      ? path.join(paths.systemAudioBuffer(), `${systemAudioState.sessionId}-system-${stamp}.wav`)
+      : null;
+    const tempMicAudioPath = micAudioChunks.length
+      ? path.join(paths.buffer(), `${bufferState.sessionId}-mic-${stamp}.webm`)
+      : null;
+    if (tempSystemAudioPath) await concatFiles(systemAudioChunks, tempSystemAudioPath);
+    if (tempMicAudioPath) await concatFiles(micAudioChunks, tempMicAudioPath);
     try {
-      const offset = syncOffsetSeconds(streamStartMs(audioEntries[0]), streamStartMs(videoSegments[0]));
       const muxArgs = ['-y'];
-      if (offset < 0) muxArgs.push('-itsoffset', String(Math.abs(offset)));
       muxArgs.push('-i', tempVideoPath);
-      if (offset > 0) muxArgs.push('-itsoffset', String(offset));
+      const filterInputs = [];
+      let audioInputIndex = 1;
+      if (tempSystemAudioPath) {
+        const offset = syncOffsetSeconds(streamStartMs(systemAudioEntries[0]), streamStartMs(videoSegments[0]));
+        if (offset > 0) muxArgs.push('-itsoffset', String(offset));
+        muxArgs.push('-i', tempSystemAudioPath);
+        filterInputs.push(`[${audioInputIndex}:a]volume=${SYSTEM_MUX_VOLUME}[sys]`);
+        audioInputIndex += 1;
+      }
+      if (tempMicAudioPath) {
+        const offset = syncOffsetSeconds(streamStartMs(micAudioEntries[0]), streamStartMs(videoSegments[0]));
+        if (offset > 0) muxArgs.push('-itsoffset', String(offset));
+        muxArgs.push('-i', tempMicAudioPath);
+        filterInputs.push(`[${audioInputIndex}:a]volume=${MIC_MUX_VOLUME}[mic]`);
+        audioInputIndex += 1;
+      }
+
+      let audioMap = '1:a:0';
+      if (tempSystemAudioPath && tempMicAudioPath) {
+        const filter = [
+          ...filterInputs,
+          `[sys][mic]amix=inputs=2:duration=longest:normalize=0,${CLIP_AUDIO_FILTER}[aout]`
+        ].join(';');
+        muxArgs.push('-filter_complex', filter);
+        audioMap = '[aout]';
+      } else if (tempSystemAudioPath) {
+        muxArgs.push('-filter:a', `volume=${SYSTEM_MUX_VOLUME},${CLIP_AUDIO_FILTER}`);
+      } else {
+        muxArgs.push('-filter:a', `volume=${MIC_MUX_VOLUME},${CLIP_AUDIO_FILTER}`);
+      }
+
       muxArgs.push(
-        '-i', tempAudioPath,
         '-map', '0:v:0',
-        '-map', '1:a:0',
+        '-map', audioMap,
         '-c:v', 'copy',
         '-c:a', 'aac',
-        '-b:a', '192k',
-        '-af', 'aresample=async=1:first_pts=0',
+        '-b:a', '320k',
+        '-ar', '48000',
+        '-ac', '2',
         '-avoid_negative_ts', 'make_zero',
+        '-movflags', '+faststart',
         '-shortest',
         filePath
       );
       await runFfmpeg(muxArgs);
     } finally {
-      await fs.rm(tempAudioPath, { force: true }).catch(() => {});
+      if (tempSystemAudioPath) await fs.rm(tempSystemAudioPath, { force: true }).catch(() => {});
+      if (tempMicAudioPath) await fs.rm(tempMicAudioPath, { force: true }).catch(() => {});
     }
   }
 
   await fs.rm(tempVideoPath, { force: true }).catch(() => {});
+  logLine('clip', 'gpu-saved', {
+    filePath,
+    videoSegments: videoSegments.length,
+    audioSegments: audioChunks.length,
+    systemAudioSegments: systemAudioChunks.length,
+    micAudioSegments: micAudioChunks.length
+  });
   showClipOverlay();
-  return { filePath, clips: await listClips() };
+  return {
+    filePath,
+    clips: await listClips(),
+    audioSegments: audioChunks.length,
+    systemAudioSegments: systemAudioChunks.length,
+    micAudioSegments: micAudioChunks.length
+  };
 }
 
 function parseSeconds(value) {
@@ -952,6 +1352,58 @@ async function listClips() {
   return clips.sort((a, b) => b.createdAt - a.createdAt);
 }
 
+function isInsideScreenshotDir(filePath) {
+  const resolved = path.resolve(filePath);
+  const root = path.resolve(paths.screenshots());
+  return resolved === root || resolved.startsWith(root + path.sep);
+}
+
+async function listScreenshots() {
+  await fs.mkdir(paths.screenshots(), { recursive: true });
+  const entries = await fs.readdir(paths.screenshots(), { withFileTypes: true });
+  const shots = await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && ['.png', '.jpg', '.jpeg', '.webp'].includes(path.extname(entry.name).toLowerCase()))
+      .map(async (entry) => {
+        const filePath = path.join(paths.screenshots(), entry.name);
+        const stat = await fs.stat(filePath);
+        return {
+          name: entry.name,
+          path: filePath,
+          url: `${pathToFileURL(filePath).href}?v=${Math.round(stat.mtimeMs)}`,
+          size: stat.size,
+          createdAt: stat.birthtimeMs
+        };
+      })
+  );
+  return shots.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+async function getCaptureSource() {
+  const sources = await desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: 1, height: 1 }
+  });
+
+  if (!sources.length) {
+    throw new Error('No screen source available');
+  }
+
+  const primaryDisplay = screen.getPrimaryDisplay();
+  const exact = sources.find((source) => String(source.display_id || '') === String(primaryDisplay.id || ''));
+  const source = exact || sources[0];
+  logLine('capture', 'source-selected', {
+    id: source.id,
+    name: source.name,
+    displayId: source.display_id || null
+  });
+  return {
+    id: source.id,
+    name: source.name,
+    displayId: source.display_id || null
+  };
+}
+
 function setupCaptureHandler() {
   session.defaultSession.setDisplayMediaRequestHandler(
     async (_request, callback) => {
@@ -972,12 +1424,17 @@ function setupIpc() {
   ipcMain.handle('app:init', async () => ({
     settings,
     clipsPath: paths.clips(),
+    screenshotsPath: paths.screenshots(),
     clips: await listClips(),
-    notificationSounds: listNotificationSounds()
+    screenshots: await listScreenshots(),
+    notificationSounds: listNotificationSounds(),
+    logPath: paths.log()
   }));
 
   ipcMain.handle('settings:save', async (_event, next) => saveSettings(next));
+  ipcMain.handle('capture:get-source', getCaptureSource);
   ipcMain.handle('clips:list', listClips);
+  ipcMain.handle('screenshots:list', listScreenshots);
   ipcMain.handle('buffer:reset', resetBuffer);
   ipcMain.handle('buffer:chunk', (_event, payload) => writeBufferChunk(payload));
   ipcMain.handle('buffer:save-clip', (_event, payload) => saveBufferClip(payload));
@@ -1010,6 +1467,12 @@ function setupIpc() {
     shell.showItemInFolder(resolved);
     return true;
   });
+  ipcMain.handle('screenshot:reveal', (_event, shotPath) => {
+    const resolved = path.resolve(shotPath);
+    if (!isInsideScreenshotDir(resolved) || !fsSync.existsSync(resolved)) throw new Error('Invalid screenshot path');
+    shell.showItemInFolder(resolved);
+    return true;
+  });
   ipcMain.handle('audio:list-apps', listAudioApps);
   ipcMain.handle('sound:list', () => listNotificationSounds());
   ipcMain.handle('sound:add', addNotificationSound);
@@ -1018,24 +1481,35 @@ function setupIpc() {
 
   ipcMain.handle('window:minimize', () => mainWindow?.minimize());
   ipcMain.handle('window:hide', () => mainWindow?.hide());
+  ipcMain.handle('window:show', () => {
+    showWindow();
+    return true;
+  });
   ipcMain.handle('window:toggle-maximize', () => {
     if (!mainWindow) return false;
     if (mainWindow.isMaximized()) mainWindow.unmaximize();
     else mainWindow.maximize();
     return mainWindow.isMaximized();
   });
+  ipcMain.handle('debug:log', (_event, payload) => {
+    logLine('renderer', payload?.message || 'event', payload?.extra ?? null);
+    return true;
+  });
 }
 
 const singleInstanceLock = app.requestSingleInstanceLock();
 
 if (!singleInstanceLock) {
-  app.quit();
+  app.exit(0);
 } else {
-  app.on('second-instance', () => showWindow());
+  app.on('second-instance', () => {
+    app.whenReady().then(() => showWindow()).catch(() => {});
+  });
 
   app.whenReady().then(async () => {
     await ensureDirs();
     await loadSettings();
+    logLine('app', 'ready', { packaged: app.isPackaged, ffmpegPath, version: app.getVersion() });
     app.setName(APP_NAME);
     app.setAppUserModelId(APP_NAME);
     protocol.registerFileProtocol('papatya', (request, callback) => {
@@ -1049,7 +1523,6 @@ if (!singleInstanceLock) {
     setupCaptureHandler();
     setupIpc();
     createWindow();
-    createOverlayWindow();
     createTray();
     registerHotkey();
     setupAutoUpdates();
@@ -1061,14 +1534,26 @@ app.on('window-all-closed', () => {});
 app.on('will-quit', () => {
   isQuitting = true;
   clearInterval(updateCheckTimer);
-  stopGpuCapture();
   globalShortcut.unregisterAll();
+  logLine('app', 'will-quit');
 });
 
-app.on('open-file', () => showWindow());
+app.on('open-file', () => {
+  app.whenReady().then(() => showWindow()).catch(() => {});
+});
 
 app.on('web-contents-created', (_event, contents) => {
   contents.on('will-navigate', (event, url) => {
     if (!url.startsWith('file://')) event.preventDefault();
   });
+});
+
+process.on('uncaughtException', (error) => {
+  logLine('main-error', error.message, error.stack || '');
+});
+
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : '';
+  logLine('main-rejection', message, stack);
 });

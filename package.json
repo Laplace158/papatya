@@ -1,6 +1,6 @@
 {
   "name": "papatya",
-  "version": "1.0.1",
+  "version": "1.0.9",
   "description": "A lightweight Papatya background clip recorder.",
   "main": "src/main.js",
   "scripts": {
@@ -33,6 +33,9 @@
     "appId": "com.papatya.cliprecorder",
     "productName": "Papatya",
     "asar": true,
+    "asarUnpack": [
+      "assets/audio-loopback/**"
+    ],
     "files": [
       "src/**/*",
       "scripts/**/*",

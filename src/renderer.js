@@ -6,7 +6,10 @@ const QUALITY = {
 };
 
 const SEGMENT_MS = 5000;
-const AUDIO_BITRATE = 192_000;
+const AUDIO_SEGMENT_MS = 1000;
+const AUDIO_BITRATE = 320_000;
+const SYSTEM_AUDIO_GAIN = 1.0;
+const MIC_AUDIO_GAIN = 0.14;
 
 const state = {
   settings: null,
@@ -21,18 +24,31 @@ const state = {
   chunkId: 0,
   chunks: [],
   clipsPath: '',
+  screenshotsPath: '',
   clips: [],
+  screenshots: [],
   selectedClip: null,
+  selectedShot: null,
+  libraryMode: 'clips',
   editorClip: null,
   audioApps: [],
   notificationSounds: [],
   crop: { x: 0.05, y: 0.05, w: 0.9, h: 0.9 },
   cropDrag: null,
   saving: false,
-  stoppingForSave: false
+  stoppingForSave: false,
+  captureReady: false,
+  gpuFallbackAttempted: false,
+  startPromise: null,
+  lastSaveAttemptAt: 0,
+  logPath: ''
 };
 
 const $ = (id) => document.getElementById(id);
+
+function debugLog(message, extra = null) {
+  window.clipforge.debugLog(message, extra).catch(() => {});
+}
 
 function toast(message) {
   const node = $('toast');
@@ -73,6 +89,21 @@ function setClipNameInput(clip) {
   if (stripButton) stripButton.disabled = !clip;
 }
 
+function setLibraryMode(mode) {
+  state.libraryMode = mode === 'screenshots' ? 'screenshots' : 'clips';
+  $('clipsModeBtn')?.classList.toggle('active', state.libraryMode === 'clips');
+  $('shotsModeBtn')?.classList.toggle('active', state.libraryMode === 'screenshots');
+  $('libraryTypeLabel').textContent = state.libraryMode === 'clips' ? 'Klipler' : 'Resimler';
+  $('libraryHint').textContent = state.libraryMode === 'clips'
+    ? 'Tek tık oynat, çift tık klasör'
+    : 'Tek tık göster, çift tık klasör';
+  $('clipNameInput').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
+  $('renameSelectedBtn').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
+  $('stripAudioBtn').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
+  $('deleteSelectedBtn').disabled = state.libraryMode !== 'clips' || !state.selectedClip;
+  if (state.libraryMode === 'clips') hideShotPreview();
+}
+
 function clearPlayerSource(player) {
   if (!player) return;
   player.pause();
@@ -85,6 +116,24 @@ function loadClipIntoPlayer(player, clip) {
   player.dataset.fallbackTried = '0';
   player.src = clip.url;
   player.load();
+}
+
+function hideShotPreview() {
+  const shot = $('shotPlayer');
+  if (!shot) return;
+  shot.style.display = 'none';
+  shot.removeAttribute('src');
+}
+
+function showShotPreview(item) {
+  const video = $('clipPlayer');
+  const shot = $('shotPlayer');
+  if (!shot || !video) return;
+  video.pause();
+  video.removeAttribute('src');
+  video.load();
+  shot.src = item.url;
+  shot.style.display = 'block';
 }
 
 function tryFallbackClipUrl(player, clip) {
@@ -108,7 +157,7 @@ function updateStats() {
   $('qualityStat').textContent = fmtQuality(s.quality);
   $('fpsStat').textContent = String(s.fps);
   $('qualityBadge').textContent = fmtQuality(s.quality);
-  $('hotkeyBadge').textContent = s.hotkey;
+  $('hotkeyBadge').textContent = `${s.hotkey} / ${s.screenshotHotkey || 'F9'}`;
   $('clipPathStat').textContent = state.clipsPath.split(/[\\/]/).slice(-2).join('\\');
   $('hotkeyInput').value = s.hotkey;
   $('durationInput').value = s.clipSeconds;
@@ -126,6 +175,7 @@ function setRecorderStatus(label, detail, active = true) {
   $('recordState').textContent = label;
   $('bufferState').textContent = detail;
   $('recordDot').classList.toggle('inactive', !active);
+  debugLog('status', { label, detail, active });
 }
 
 function syncPreviewAttachment() {
@@ -161,6 +211,89 @@ function getMimeType() {
 function getAudioMimeType() {
   if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
   return 'audio/webm';
+}
+
+async function getDesktopStream({ width, height, fps, includeAudio, audioOnly = false, audioSourceId = true }) {
+  const source = await window.clipforge.getCaptureSource();
+  debugLog('desktop-source', source);
+
+  const videoMandatory = {
+    chromeMediaSource: 'desktop',
+    chromeMediaSourceId: source.id,
+    minWidth: width,
+    maxWidth: width,
+    minHeight: height,
+    maxHeight: height,
+    minFrameRate: audioOnly ? 1 : fps,
+    maxFrameRate: audioOnly ? 1 : fps
+  };
+
+  const audioMandatory = {
+    chromeMediaSource: 'desktop',
+    ...(audioSourceId ? { chromeMediaSourceId: source.id } : {})
+  };
+
+  return navigator.mediaDevices.getUserMedia({
+    audio: includeAudio ? { mandatory: audioMandatory } : false,
+    video: { mandatory: videoMandatory }
+  });
+}
+
+async function getDisplayStream({ width, height, fps, includeAudio, audioOnly = false }) {
+  const constraints = {
+    video: audioOnly
+      ? {
+          frameRate: 1,
+          width: { ideal: width },
+          height: { ideal: height }
+        }
+      : {
+          frameRate: fps,
+          width: { ideal: width },
+          height: { ideal: height }
+        },
+    audio: includeAudio
+      ? {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          sampleRate: 48000,
+          channelCount: 2
+        }
+      : false
+  };
+
+  return navigator.mediaDevices.getDisplayMedia(constraints);
+}
+
+async function getCaptureStream(options) {
+  if (options.audioOnly) {
+    try {
+      const stream = await getDesktopStream(options);
+      debugLog('capture-stream-ok', { method: 'desktop-source-audio-first', includeAudio: options.includeAudio });
+      return stream;
+    } catch (desktopError) {
+      debugLog('capture-stream-desktop-audio-first-failed', { message: desktopError.message, includeAudio: options.includeAudio });
+      try {
+        const stream = await getDesktopStream({ ...options, audioSourceId: false });
+        debugLog('capture-stream-ok', { method: 'desktop-source-audio-legacy', includeAudio: options.includeAudio });
+        return stream;
+      } catch (legacyError) {
+        debugLog('capture-stream-desktop-audio-legacy-failed', { message: legacyError.message, includeAudio: options.includeAudio });
+      }
+    }
+  }
+
+  try {
+    const stream = await getDisplayStream(options);
+    debugLog('capture-stream-ok', { method: 'display-media', includeAudio: options.includeAudio });
+    return stream;
+  } catch (displayError) {
+    debugLog('capture-stream-display-failed', { message: displayError.message, includeAudio: options.includeAudio });
+    const stream = await getDesktopStream(options);
+    debugLog('capture-stream-ok', { method: 'desktop-source', includeAudio: options.includeAudio });
+    return stream;
+  }
 }
 
 async function populateMicrophones() {
@@ -357,6 +490,7 @@ async function cleanupCaptureStreams() {
   state.micStream = null;
   state.audioContext = null;
   state.audioSources = [];
+  state.captureReady = false;
 }
 
 async function buildRecordingStream(displayStream, options = {}) {
@@ -386,15 +520,34 @@ async function buildRecordingStream(displayStream, options = {}) {
     }
   }
 
-  const audioStreams = [displayStream, micStream].filter((stream) => stream?.getAudioTracks().length);
-  if (audioStreams.length) {
-    state.audioContext = new AudioContext({ sampleRate: 48000 });
+  const hasSystemAudio = Boolean(displayStream?.getAudioTracks().length);
+  const hasMicAudio = Boolean(micStream?.getAudioTracks().length);
+  if (hasSystemAudio || hasMicAudio) {
+    state.audioContext = new AudioContext({ sampleRate: 48000, latencyHint: 'playback' });
     const destination = state.audioContext.createMediaStreamDestination();
-    for (const stream of audioStreams) {
-      const source = state.audioContext.createMediaStreamSource(stream);
-      source.connect(destination);
-      state.audioSources.push(source);
+
+    if (hasSystemAudio) {
+      const source = state.audioContext.createMediaStreamSource(displayStream);
+      const gain = state.audioContext.createGain();
+      gain.gain.value = SYSTEM_AUDIO_GAIN;
+      source.connect(gain).connect(destination);
+      state.audioSources.push(source, gain);
     }
+
+    if (hasMicAudio) {
+      const source = state.audioContext.createMediaStreamSource(micStream);
+      const gain = state.audioContext.createGain();
+      gain.gain.value = MIC_AUDIO_GAIN;
+      source.connect(gain).connect(destination);
+      state.audioSources.push(source, gain);
+    }
+
+    debugLog('audio-mix', {
+      system: hasSystemAudio,
+      mic: hasMicAudio,
+      systemGain: hasSystemAudio ? SYSTEM_AUDIO_GAIN : 0,
+      micGain: hasMicAudio ? MIC_AUDIO_GAIN : 0
+    });
     destination.stream.getAudioTracks().forEach((track) => mixedStream.addTrack(track));
   }
 
@@ -447,6 +600,8 @@ function startSegmentRecorder(mimeType, bitrate) {
   };
 
   state.recorder.onerror = (event) => {
+    state.captureReady = false;
+    debugLog('segment-recorder-error', { message: event.error?.message || 'Unknown error' });
     setRecorderStatus('Recorder error', event.error?.message || 'Unknown error', false);
   };
 
@@ -476,7 +631,7 @@ function startAudioSegmentRecorder(mimeType) {
     const id = String(++state.chunkId);
     state.chunks.push({ id, at, startedAt: segmentStartedAt, endedAt: at });
 
-    const keepMs = (Number(state.settings.clipSeconds) * 1000) + SEGMENT_MS * 2;
+    const keepMs = (Number(state.settings.clipSeconds) * 1000) + AUDIO_SEGMENT_MS * 8;
     const cutoff = Date.now() - keepMs;
     state.chunks = state.chunks.filter((chunk) => chunk.at >= cutoff);
 
@@ -492,10 +647,12 @@ function startAudioSegmentRecorder(mimeType) {
       .finally(() => state.pendingWrites.delete(write));
 
     state.pendingWrites.add(write);
-    setRecorderStatus('GPU Recording', `${Math.round((state.chunks.length * SEGMENT_MS) / 1000)}s audio buffered`, true);
+    setRecorderStatus('GPU Recording', `${Math.round((state.chunks.length * AUDIO_SEGMENT_MS) / 1000)}s audio buffered`, true);
   };
 
   state.recorder.onerror = (event) => {
+    state.captureReady = false;
+    debugLog('audio-recorder-error', { message: event.error?.message || 'Unknown error' });
     setRecorderStatus('Audio recorder error', event.error?.message || 'Unknown error', false);
   };
 
@@ -506,10 +663,11 @@ function startAudioSegmentRecorder(mimeType) {
   state.recorder.start();
   state.segmentTimer = setTimeout(() => {
     if (state.recorder?.state === 'recording') state.recorder.stop();
-  }, SEGMENT_MS);
+  }, AUDIO_SEGMENT_MS);
 }
 
 async function startGpuRecorder() {
+  debugLog('start-gpu-recorder', { includeAudio: state.settings.includeAudio, includeMic: state.settings.includeMic });
   state.stoppingForSave = true;
   await stopCurrentRecorder();
   state.stoppingForSave = false;
@@ -526,40 +684,61 @@ async function startGpuRecorder() {
     clipSeconds: Number($('durationInput')?.value || state.settings.clipSeconds)
   });
 
+  const q = QUALITY[state.settings.quality] || QUALITY[720];
   const needsSystemAudio = Boolean(state.settings.includeAudio);
   const needsMic = Boolean(state.settings.includeMic);
+  let systemAudioStarted = false;
 
   if (needsSystemAudio) {
-    const audioOnlyDisplayConstraints = {
-      video: {
-        frameRate: 1,
-        width: { ideal: 16 },
-        height: { ideal: 16 }
-      },
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-        sampleRate: 48000,
-        channelCount: 2
-      }
-    };
-
     try {
-      state.displayStream = await navigator.mediaDevices.getDisplayMedia(audioOnlyDisplayConstraints);
-      state.displayStream.getVideoTracks().forEach((track) => track.enabled = false);
+      state.displayStream = await getCaptureStream({
+        width: q.width,
+        height: q.height,
+        fps: 1,
+        includeAudio: true,
+        audioOnly: true
+      });
+      systemAudioStarted = state.displayStream.getAudioTracks().length > 0;
+      debugLog('gpu-audio-display-ok', {
+        audioTracks: state.displayStream.getAudioTracks().length,
+        videoTracks: state.displayStream.getVideoTracks().length
+      });
     } catch (error) {
-      toast('Sistem sesi baslatilamadi, GPU kayit sessiz devam ediyor.');
+      debugLog('gpu-audio-display-failed', { message: error.message });
+      toast(needsMic ? 'Sistem sesi alinamadi, mikrofonla devam ediyor.' : 'Sistem sesi alinamadi, video sessiz devam ediyor.');
     }
   }
 
   state.stream = await buildRecordingStream(state.displayStream, { includeVideo: false });
   if (state.stream.getAudioTracks().length || needsMic) startAudioSegmentRecorder(getAudioMimeType());
+  state.captureReady = true;
+  state.gpuFallbackAttempted = false;
   syncPreviewAttachment();
-  setRecorderStatus('GPU Recording', needsSystemAudio || needsMic ? 'NVENC video + audio buffer' : 'NVENC video only', true);
+  const hasAudioTracks = state.stream.getAudioTracks().length > 0;
+  const detail = hasAudioTracks
+    ? systemAudioStarted
+      ? 'NVENC video + system audio'
+      : 'NVENC video + mic'
+    : needsSystemAudio
+      ? 'NVENC video only - sistem sesi yok'
+      : 'NVENC video only';
+  setRecorderStatus('GPU Recording', detail, true);
 }
 
 async function startRecorder() {
+  if (state.startPromise) return state.startPromise;
+  state.startPromise = startRecorderInner().finally(() => {
+    state.startPromise = null;
+  });
+  return state.startPromise;
+}
+
+async function startRecorderInner() {
+  debugLog('start-recorder', {
+    encoderMode: state.settings.encoderMode,
+    includeAudio: state.settings.includeAudio,
+    includeMic: state.settings.includeMic
+  });
   if ((state.settings.encoderMode || 'gpu') === 'gpu') {
     return startGpuRecorder();
   }
@@ -577,49 +756,91 @@ async function startRecorder() {
   await window.clipforge.resetBuffer();
 
   const q = QUALITY[state.settings.quality] || QUALITY[720];
-  const constraints = {
-    video: {
-      frameRate: state.settings.fps,
-      width: { ideal: q.width },
-      height: { ideal: q.height }
-    },
-    audio: state.settings.includeAudio
-      ? {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          sampleRate: 48000,
-          channelCount: 2
-        }
-      : false
-  };
-
   try {
-    state.displayStream = await navigator.mediaDevices.getDisplayMedia(constraints);
+    state.displayStream = await getCaptureStream({
+      width: q.width,
+      height: q.height,
+      fps: state.settings.fps,
+      includeAudio: Boolean(state.settings.includeAudio)
+    });
+    debugLog('compat-display-ok', { withAudio: Boolean(state.settings.includeAudio) });
   } catch (error) {
-    if (!state.settings.includeAudio) throw error;
-    state.displayStream = await navigator.mediaDevices.getDisplayMedia({ ...constraints, audio: false });
-    toast('Ses yakalama baslatilamadi, kayit sessiz devam ediyor.');
+    if (state.settings.includeAudio) {
+      try {
+        state.displayStream = await getCaptureStream({
+          width: q.width,
+          height: q.height,
+          fps: state.settings.fps,
+          includeAudio: false
+        });
+        debugLog('compat-display-audio-failed', { message: error.message });
+        toast('Ses yakalama baslatilamadi, kayit sessiz devam ediyor.');
+      } catch (silentError) {
+        return switchCompatToGpu(silentError);
+      }
+    } else {
+      return switchCompatToGpu(error);
+    }
   }
 
   state.stream = await buildRecordingStream(state.displayStream);
   syncPreviewAttachment();
   startSegmentRecorder(getMimeType(), q.bitrate);
+  state.captureReady = true;
   setRecorderStatus('Recording', 'Segment buffer warming up', true);
+}
+
+async function switchCompatToGpu(error) {
+  debugLog('compat-failed-switch-gpu', { message: error.message });
+  state.captureReady = false;
+  state.settings = await window.clipforge.saveSettings({ ...state.settings, encoderMode: 'gpu', captureBackend: 'gdigrab' });
+  $('encoderInput').value = 'gpu';
+  updateStats();
+  $('settingsNote').textContent = 'Uyumluluk modu acilmadi. GPU kayda gecildi.';
+  toast('Uyumluluk modu acilmadi, GPU kayda gecildi.');
+  return startGpuRecorder();
+}
+
+async function ensureRecorderActive(source) {
+  if (state.captureReady) return true;
+  debugLog('ensure-recorder-active', { source, encoderMode: state.settings?.encoderMode });
+  try {
+    await window.clipforge.show().catch(() => {});
+    await startRecorder();
+    return state.captureReady;
+  } catch (error) {
+    debugLog('ensure-recorder-failed', { source, message: error.message });
+    setRecorderStatus('Kayit baslamadi', error.message, false);
+    toast(`Kayit baslatilamadi. Log: ${state.logPath || 'Papatya klasoru'}`);
+    throw error;
+  }
 }
 
 async function saveBufferedClip() {
   if (state.saving) return;
-  const isGpu = (state.settings.encoderMode || 'gpu') === 'gpu';
+  const now = Date.now();
+  if (now - state.lastSaveAttemptAt < 1200) return;
+  state.lastSaveAttemptAt = now;
+  state.saving = true;
+  let isGpu = false;
+  try {
+    await ensureRecorderActive('save-request');
+    isGpu = (state.settings.encoderMode || 'gpu') === 'gpu';
+  } catch {
+    state.saving = false;
+    return;
+  }
   if (!isGpu && !state.chunks.length) {
     toast('Buffer henuz hazir degil.');
+    debugLog('save-skipped-empty-buffer', { mode: 'compat' });
+    state.saving = false;
     return;
   }
 
-  state.saving = true;
   state.stoppingForSave = true;
   const requestedAt = Date.now();
   try {
+    debugLog('save-start', { isGpu, requestedAt });
     await stopCurrentRecorder();
     await Promise.allSettled([...state.pendingWrites]);
 
@@ -627,10 +848,14 @@ async function saveBufferedClip() {
     const result = isGpu
       ? await window.clipforge.saveGpuClip({ title, requestedAt })
       : await window.clipforge.saveBufferedClip({ title });
-    renderClips(result.clips);
+    state.clips = result.clips;
+    renderLibraryPane();
     if (result.clips[0]) previewClip(result.clips[0], false);
-    toast('Klip kaydedildi.');
+    debugLog('save-success', { isGpu, clipCount: result.clips.length });
+    toast(result.audioSegments === 0 ? 'Klip kaydedildi, ses yok.' : 'Klip kaydedildi.');
   } catch (error) {
+    state.captureReady = false;
+    debugLog('save-failed', { isGpu, message: error.message });
     toast(`Kayit basarisiz: ${error.message}`);
   } finally {
     state.stoppingForSave = false;
@@ -646,6 +871,7 @@ async function saveBufferedClip() {
       const q = QUALITY[state.settings.quality] || QUALITY[720];
       if (isGpu) startAudioSegmentRecorder(getAudioMimeType());
       else startSegmentRecorder(getMimeType(), q.bitrate);
+      state.captureReady = true;
     }
   }
 }
@@ -689,6 +915,45 @@ function renderClips(clips) {
   setClipNameInput(state.selectedClip);
 }
 
+function renderScreenshots(shots) {
+  state.screenshots = shots;
+  if (state.selectedShot) {
+    state.selectedShot = shots.find((shot) => shot.path === state.selectedShot.path) || null;
+  }
+  const grid = $('clipGrid');
+  grid.innerHTML = '';
+
+  if (!shots.length) {
+    grid.innerHTML = '<div class="empty">Henuz ekran goruntusu yok. F9 ile ilk goruntuyu al.</div>';
+    $('selectedClip').textContent = 'Bir resim sec';
+    $('selectedClip').removeAttribute('title');
+    hideShotPreview();
+    $('emptyPlayer').classList.remove('hidden');
+    return;
+  }
+
+  for (const shot of shots) {
+    const item = document.createElement('button');
+    item.className = 'clip-row';
+    item.dataset.path = shot.path;
+    item.innerHTML = `
+      <div class="clip-thumb">PNG</div>
+      <span>
+        <strong>${shot.name}</strong>
+        <small>${new Date(shot.createdAt).toLocaleString()} - ${fmtBytes(shot.size)}</small>
+      </span>
+    `;
+    item.addEventListener('click', () => previewScreenshot(shot));
+    item.addEventListener('dblclick', async () => {
+      previewScreenshot(shot);
+      await window.clipforge.revealScreenshot(shot.path).catch(() => toast('Klasor acilamadi.'));
+    });
+    grid.appendChild(item);
+  }
+
+  if (state.selectedShot) highlightSelected();
+}
+
 function populateEditorClips() {
   const select = $('editorClipSelect');
   if (!select) return;
@@ -718,12 +983,14 @@ function populateEditorClips() {
 
 function highlightSelected() {
   document.querySelectorAll('.clip-row').forEach((node) => {
-    node.classList.toggle('active', node.dataset.path === state.selectedClip?.path);
+    const activePath = state.libraryMode === 'clips' ? state.selectedClip?.path : state.selectedShot?.path;
+    node.classList.toggle('active', node.dataset.path === activePath);
   });
 }
 
 function previewClip(clip, playNow) {
   const player = $('clipPlayer');
+  hideShotPreview();
   state.selectedClip = clip;
   highlightSelected();
   setClipNameInput(clip);
@@ -732,6 +999,34 @@ function previewClip(clip, playNow) {
   $('emptyPlayer').classList.add('hidden');
   loadClipIntoPlayer(player, clip);
   if (playNow) player.play().catch(() => {});
+}
+
+function previewScreenshot(shot) {
+  state.selectedShot = shot;
+  highlightSelected();
+  $('selectedClip').textContent = shot.path;
+  $('selectedClip').title = shot.path;
+  $('emptyPlayer').classList.add('hidden');
+  setClipNameInput(null);
+  showShotPreview(shot);
+}
+
+function renderLibraryPane() {
+  setLibraryMode(state.libraryMode);
+  if (state.libraryMode === 'screenshots') {
+    renderScreenshots(state.screenshots);
+    return;
+  }
+  renderClips(state.clips);
+}
+
+async function refreshLibraryPane() {
+  if (state.libraryMode === 'screenshots') {
+    state.screenshots = await window.clipforge.listScreenshots();
+  } else {
+    state.clips = await window.clipforge.listClips();
+  }
+  renderLibraryPane();
 }
 
 function setEditorClip(clip) {
@@ -798,7 +1093,8 @@ async function deleteSelectedClip() {
   $('selectedClip').removeAttribute('title');
   $('emptyPlayer').classList.remove('hidden');
   setClipNameInput(null);
-  renderClips(clips);
+  state.clips = clips;
+  renderLibraryPane();
   toast('Klip silindi.');
 }
 
@@ -821,7 +1117,8 @@ async function renameSelectedClip() {
 
   try {
     const result = await window.clipforge.renameClip({ clipPath: oldPath, name });
-    renderClips(result.clips);
+    state.clips = result.clips;
+    renderLibraryPane();
     const renamed = result.clips.find((clip) => clip.path === result.filePath);
     if (renamed) {
       previewClip(renamed, false);
@@ -845,7 +1142,8 @@ async function stripSelectedAudio() {
   const oldPath = state.selectedClip.path;
   try {
     const result = await window.clipforge.stripAudio({ clipPath: oldPath });
-    renderClips(result.clips);
+    state.clips = result.clips;
+    renderLibraryPane();
     const silentClip = result.clips.find((clip) => clip.path === result.filePath) || result.clips[0];
     if (silentClip) previewClip(silentClip, false);
     toast('Sessiz kopya kaydedildi.');
@@ -887,7 +1185,8 @@ async function exportTrimmedClip() {
       end,
       crop: state.crop
     });
-    renderClips(result.clips);
+    state.clips = result.clips;
+    renderLibraryPane();
     const exported = result.clips.find((clip) => clip.path === result.filePath) || result.clips[0];
     if (exported) {
       setEditorClip(exported);
@@ -1019,6 +1318,7 @@ function switchView(view) {
 async function applySettings() {
   const next = {
     hotkey: $('hotkeyInput').value.trim() || 'F8',
+    screenshotHotkey: state.settings?.screenshotHotkey || 'F9',
     clipSeconds: Math.max(5, Math.min(180, Number($('durationInput').value || 30))),
     quality: $('qualityInput').value,
     fps: Number($('fpsInput').value),
@@ -1030,6 +1330,7 @@ async function applySettings() {
   };
   state.settings = await window.clipforge.saveSettings(next);
   updateStats();
+  state.captureReady = false;
   await startRecorder();
   toast('Ayarlar uygulandi.');
 }
@@ -1047,7 +1348,19 @@ function bindUi() {
   document.querySelectorAll('.nav-item').forEach((node) => node.addEventListener('click', () => switchView(node.dataset.view)));
   $('openLibraryBtn').addEventListener('click', () => switchView('library'));
   $('saveNowBtn').addEventListener('click', saveBufferedClip);
-  $('refreshClipsBtn').addEventListener('click', async () => renderClips(await window.clipforge.listClips()));
+  $('refreshClipsBtn').addEventListener('click', refreshLibraryPane);
+  $('clipsModeBtn').addEventListener('click', () => {
+    if (state.libraryMode === 'clips') return;
+    setLibraryMode('clips');
+    renderLibraryPane();
+    if (state.selectedClip) previewClip(state.selectedClip, false);
+  });
+  $('shotsModeBtn').addEventListener('click', () => {
+    if (state.libraryMode === 'screenshots') return;
+    setLibraryMode('screenshots');
+    renderLibraryPane();
+    if (state.selectedShot) previewScreenshot(state.selectedShot);
+  });
   $('saveSettingsBtn').addEventListener('click', applySettings);
   $('refreshAudioAppsBtn').addEventListener('click', loadAudioApps);
   $('addSoundBtn').addEventListener('click', addNotificationSound);
@@ -1104,12 +1417,59 @@ function bindUi() {
 async function boot() {
   bindUi();
   window.clipforge.onSaveClip(saveBufferedClip);
-  window.clipforge.onHotkeyStatus(({ hotkey, registered }) => {
-    $('settingsNote').textContent = registered ? `${hotkey} kisayolu aktif.` : `${hotkey} kisayolu baska bir uygulama tarafindan kullaniliyor.`;
+  window.clipforge.onScreenshotSaved(({ filePath, error }) => {
+    if (error) {
+      toast(`Ekran goruntusu kaydedilemedi: ${error}`);
+      return;
+    }
+    if (filePath) {
+      window.clipforge.listScreenshots()
+        .then((shots) => {
+          state.screenshots = shots;
+          if (state.libraryMode === 'screenshots') renderLibraryPane();
+        })
+        .catch(() => {});
+      toast('Ekran goruntusu kaydedildi.');
+    }
+  });
+  window.clipforge.onHotkeyStatus(({ hotkey, screenshotHotkey, registered, screenshotRegistered }) => {
+    if (registered && screenshotRegistered) {
+      $('settingsNote').textContent = `${hotkey} klip, ${screenshotHotkey || 'F9'} ekran goruntusu olarak aktif.`;
+      return;
+    }
+    const failed = [];
+    if (!registered) failed.push(hotkey);
+    if (!screenshotRegistered) failed.push(screenshotHotkey || 'F9');
+    $('settingsNote').textContent = `${failed.join(', ')} kisayolu baska bir uygulama tarafindan kullaniliyor.`;
   });
   window.clipforge.onGpuStatus(({ ok, message }) => {
     if (!ok) {
+      state.captureReady = false;
+      debugLog('gpu-status-failed', { message, encoderMode: state.settings?.encoderMode });
       $('settingsNote').textContent = `GPU kayit basarisiz: ${message}`;
+      const shouldTryCompat = !/video buffer|FFmpeg baslatilamadi/i.test(message || '');
+      if (shouldTryCompat && state.settings?.encoderMode === 'gpu' && !state.gpuFallbackAttempted) {
+        state.gpuFallbackAttempted = true;
+        state.settings.encoderMode = 'compat';
+        $('encoderInput').value = 'compat';
+        window.clipforge.saveSettings({ ...state.settings, encoderMode: 'compat' })
+          .then((nextSettings) => {
+            state.settings = nextSettings;
+            updateStats();
+            return startRecorder();
+          })
+          .then(() => {
+            $('settingsNote').textContent = 'GPU desteklenmedi. Uyumluluk moduna gecildi.';
+            toast('GPU uyumsuzdu, Uyumluluk moduna gecildi.');
+            debugLog('gpu-fallback-success');
+          })
+          .catch((error) => {
+            $('settingsNote').textContent = `Kayit baslatilamadi. Log: ${state.logPath}`;
+            toast('Kayit baslatilamadi. Log dosyasini kontrol et.');
+            debugLog('gpu-fallback-failed', { message: error.message });
+          });
+        return;
+      }
       toast('GPU kayit basarisiz, Uyumluluk modunu dene.');
     }
   });
@@ -1123,18 +1483,43 @@ async function boot() {
   const init = await window.clipforge.init();
   state.settings = init.settings;
   state.clipsPath = init.clipsPath;
+  state.screenshotsPath = init.screenshotsPath || '';
+  state.clips = init.clips || [];
+  state.screenshots = init.screenshots || [];
   state.notificationSounds = init.notificationSounds || [];
+  state.logPath = init.logPath || '';
   await populateMicrophones();
   await loadAudioApps();
   updateStats();
-  renderClips(init.clips);
+  renderLibraryPane();
+  debugLog('boot-init', { settings: state.settings, logPath: state.logPath });
 
   try {
     await startRecorder();
   } catch (error) {
+    state.captureReady = false;
+    debugLog('boot-start-failed', { message: error.message });
     setRecorderStatus('Permission needed', error.message, false);
+    $('settingsNote').textContent = `Kayit baslamadi. Log: ${state.logPath}`;
     toast('Ekran kaydi baslatilamadi. Izinleri kontrol et.');
   }
 }
+
+window.addEventListener('error', (event) => {
+  debugLog('window-error', {
+    message: event.message,
+    filename: event.filename,
+    line: event.lineno,
+    column: event.colno
+  });
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  const reason = event.reason;
+  debugLog('window-rejection', {
+    message: reason?.message || String(reason),
+    stack: reason?.stack || ''
+  });
+});
 
 boot();
