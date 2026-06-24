@@ -638,6 +638,31 @@ function chooseGpuBackend(qualityKey, requestedBackend = 'auto') {
   return 'dda';
 }
 
+function normalizedFps(value = settings.fps) {
+  return Math.max(15, Math.min(60, Number(value) || 30));
+}
+
+function cfrVideoEncodeArgs({ fps, quality, audio = false }) {
+  return [
+    '-vf', `fps=${fps}`,
+    '-fps_mode', 'cfr',
+    '-r', String(fps),
+    '-c:v', 'h264_nvenc',
+    '-preset', 'p3',
+    '-tune', 'hq',
+    '-rc', 'vbr',
+    '-cq', '21',
+    '-b:v', quality.bitrate,
+    '-maxrate', quality.bitrate,
+    '-bufsize', quality.bitrate,
+    '-g', String(fps * 2),
+    '-bf', '0',
+    '-rc-lookahead', '0',
+    '-video_track_timescale', '90000',
+    ...(audio ? [] : ['-an'])
+  ];
+}
+
 function buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern }) {
   return [
     '-hide_banner',
@@ -645,6 +670,8 @@ function buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern 
     '-f', 'lavfi',
     '-i', `ddagrab=framerate=${fps}:draw_mouse=0:output_idx=0:output_fmt=8bit:allow_fallback=1`,
     '-an',
+    '-fps_mode', 'cfr',
+    '-r', String(fps),
     '-c:v', 'h264_nvenc',
     '-preset', 'p1',
     '-tune', 'ull',
@@ -658,6 +685,7 @@ function buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern 
     '-rc-lookahead', '0',
     '-zerolatency', '1',
     '-delay', '0',
+    '-video_track_timescale', '90000',
     '-f', 'segment',
     '-segment_time', String(GPU_SEGMENT_SECONDS),
     '-reset_timestamps', '1',
@@ -861,7 +889,7 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
 
   const qualityKey = String(settings.quality || '720').toLowerCase();
   const quality = QUALITY[qualityKey] || QUALITY[720];
-  const fps = Math.max(15, Math.min(60, Number(settings.fps) || 30));
+  const fps = normalizedFps(settings.fps);
   const pattern = path.join(paths.gpuBuffer(), `${gpuState.sessionId}-%05d.mp4`);
   const maxrate = quality.bitrate;
   const bufsize = maxrate;
@@ -1055,6 +1083,8 @@ async function saveGpuClip(payload) {
   const title = sanitizeFilePart(payload.title || `${APP_NAME}-${stamp}`);
   const filePath = path.join(paths.clips(), `${title}.mp4`);
   const tempVideoPath = path.join(paths.gpuBuffer(), `${gpuState.sessionId}-video-${stamp}.mp4`);
+  const outputFps = normalizedFps(settings.fps);
+  const outputQuality = QUALITY[String(settings.quality || '720').toLowerCase()] || QUALITY[720];
   await concatFiles(videoSegments.map((segment) => segment.path), tempVideoPath);
 
   const systemAudioEntries = systemAudioState.segments
@@ -1071,7 +1101,15 @@ async function saveGpuClip(payload) {
   const audioChunks = systemAudioChunks.length ? systemAudioChunks : micAudioChunks;
 
   if (!systemAudioChunks.length && !micAudioChunks.length) {
-    await fs.copyFile(tempVideoPath, filePath);
+    await runFfmpeg([
+      '-y',
+      '-fflags', '+genpts',
+      '-i', tempVideoPath,
+      '-map', '0:v:0',
+      ...cfrVideoEncodeArgs({ fps: outputFps, quality: outputQuality, audio: false }),
+      '-movflags', '+faststart',
+      filePath
+    ]);
   } else {
     const tempSystemAudioPath = systemAudioChunks.length
       ? path.join(paths.systemAudioBuffer(), `${systemAudioState.sessionId}-system-${stamp}.wav`)
@@ -1082,7 +1120,7 @@ async function saveGpuClip(payload) {
     if (tempSystemAudioPath) await concatFiles(systemAudioChunks, tempSystemAudioPath);
     if (tempMicAudioPath) await concatFiles(micAudioChunks, tempMicAudioPath);
     try {
-      const muxArgs = ['-y'];
+      const muxArgs = ['-y', '-fflags', '+genpts'];
       muxArgs.push('-i', tempVideoPath);
       const filterInputs = [];
       let audioInputIndex = 1;
@@ -1118,7 +1156,7 @@ async function saveGpuClip(payload) {
       muxArgs.push(
         '-map', '0:v:0',
         '-map', audioMap,
-        '-c:v', 'copy',
+        ...cfrVideoEncodeArgs({ fps: outputFps, quality: outputQuality, audio: true }),
         '-c:a', 'aac',
         '-b:a', '320k',
         '-ar', '48000',
