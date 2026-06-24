@@ -21,6 +21,9 @@ function resolveExecutablePath(rawPath) {
 const ffmpegPath = resolveExecutablePath(ffmpegStaticPath);
 
 const APP_NAME = 'Papatya';
+const APP_ID = 'com.papatya.cliprecorder';
+app.setName(APP_NAME);
+if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
 const SYSTEM_MUX_VOLUME = '1.0';
 const MIC_MUX_VOLUME = '0.10';
 const CLIP_AUDIO_FILTER = [
@@ -1538,7 +1541,7 @@ if (!singleInstanceLock) {
     await loadSettings();
     logLine('app', 'ready', { packaged: app.isPackaged, ffmpegPath, version: app.getVersion() });
     app.setName(APP_NAME);
-    app.setAppUserModelId(APP_NAME);
+    if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
     protocol.registerFileProtocol('papatya', (request, callback) => {
       const url = new URL(request.url);
       if (url.hostname !== 'clip') return callback({ error: -6 });

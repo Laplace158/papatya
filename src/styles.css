@@ -110,11 +110,51 @@ small,
   box-shadow: inset 0 0 0 1px rgba(241, 200, 75, 0.28);
 }
 
+.shortcut-card {
+  display: grid;
+  gap: 8px;
+  margin-top: auto;
+  margin-bottom: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background:
+    linear-gradient(135deg, rgba(241, 200, 75, 0.13), transparent 56%),
+    #101722;
+  border: 1px solid rgba(241, 200, 75, 0.28);
+}
+
+.shortcut-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+}
+
+.shortcut-row span {
+  display: grid;
+  place-items: center;
+  height: 28px;
+  border-radius: 8px;
+  color: #201600;
+  background: linear-gradient(180deg, #f7d864, #dbad2d);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.shortcut-row strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #fff9e8;
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .status-card {
   display: flex;
   align-items: center;
   gap: 12px;
-  margin-top: auto;
   min-width: 0;
   padding: 14px;
   border-radius: 12px;

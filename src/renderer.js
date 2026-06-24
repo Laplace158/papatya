@@ -298,6 +298,8 @@ function updateStats() {
   $('fpsStat').textContent = String(s.fps);
   $('qualityBadge').textContent = fmtQuality(s.quality);
   $('hotkeyBadge').textContent = `${s.hotkey} / ${s.screenshotHotkey || 'F9'}`;
+  $('clipHotkeyHint').textContent = s.hotkey || 'F8';
+  $('shotHotkeyHint').textContent = s.screenshotHotkey || 'F9';
   $('clipPathStat').textContent = state.clipsPath.split(/[\\/]/).slice(-2).join('\\');
   $('hotkeyInput').value = s.hotkey;
   $('durationInput').value = s.clipSeconds;

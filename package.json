@@ -1,6 +1,6 @@
 {
   "name": "papatya",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "description": "Papatya",
   "main": "src/main.js",
   "scripts": {
@@ -57,6 +57,7 @@
         }
       ],
       "artifactName": "Papatya-Setup-${version}.${ext}",
+      "executableName": "Papatya",
       "icon": "assets/papatya.ico",
       "requestedExecutionLevel": "highestAvailable"
     },
