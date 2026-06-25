@@ -6,10 +6,14 @@ const QUALITY = {
 };
 
 const SEGMENT_MS = 5000;
-const AUDIO_SEGMENT_MS = 1000;
+const AUDIO_SEGMENT_MS = 3000;
 const AUDIO_BITRATE = 320_000;
 const SYSTEM_AUDIO_GAIN = 1.0;
-const MIC_AUDIO_GAIN = 0.14;
+const MIC_AUDIO_GAIN = 1.0;
+const NOTIFICATION_SOUND_DELAY_MS = 1000;
+let notificationAudio = null;
+let notificationAudioUrl = '';
+let notificationTimer = null;
 
 const state = {
   settings: null,
@@ -76,6 +80,45 @@ function toast(message) {
   node.textContent = message;
   node.classList.add('show');
   setTimeout(() => node.classList.remove('show'), 2600);
+}
+
+function getSelectedNotificationSound() {
+  return state.notificationSounds.find((sound) => sound.selected && sound.exists)
+    || state.notificationSounds.find((sound) => sound.builtin && sound.exists)
+    || null;
+}
+
+function ensureNotificationAudio() {
+  const selected = getSelectedNotificationSound();
+  if (!selected?.url) return null;
+
+  if (!notificationAudio) {
+    notificationAudio = new Audio();
+    notificationAudio.preload = 'auto';
+  }
+
+  if (notificationAudioUrl !== selected.url) {
+    notificationAudioUrl = selected.url;
+    notificationAudio.src = selected.url;
+    notificationAudio.load();
+  }
+
+  notificationAudio.volume = 0.30;
+  return notificationAudio;
+}
+
+function queueNotificationSound(delayMs = NOTIFICATION_SOUND_DELAY_MS) {
+  clearTimeout(notificationTimer);
+  ensureNotificationAudio();
+  notificationTimer = setTimeout(() => {
+    const audio = ensureNotificationAudio();
+    if (!audio) return;
+    try {
+      audio.pause();
+      audio.currentTime = 0;
+    } catch {}
+    audio.play().catch(() => {});
+  }, delayMs);
 }
 
 function fmtBytes(bytes) {
@@ -582,6 +625,8 @@ function renderNotificationSounds(sounds) {
       ? 'Dosya bulunamadi, varsayilan ses calar.'
       : 'Dosya silinirse ustu cizilir.';
   }
+
+  ensureNotificationAudio();
 }
 
 async function addNotificationSound() {
@@ -638,6 +683,7 @@ async function cleanupCaptureStreams() {
 
 async function buildRecordingStream(displayStream, options = {}) {
   const includeVideo = options.includeVideo !== false;
+  const includeSystemAudio = options.includeSystemAudio !== false;
   const mixedStream = new MediaStream();
   if (includeVideo) displayStream?.getVideoTracks().forEach((track) => mixedStream.addTrack(track));
 
@@ -663,7 +709,7 @@ async function buildRecordingStream(displayStream, options = {}) {
     }
   }
 
-  const hasSystemAudio = Boolean(displayStream?.getAudioTracks().length);
+  const hasSystemAudio = includeSystemAudio && Boolean(displayStream?.getAudioTracks().length);
   const hasMicAudio = Boolean(micStream?.getAudioTracks().length);
   if (hasSystemAudio || hasMicAudio) {
     state.audioContext = new AudioContext({ sampleRate: 48000, latencyHint: 'playback' });
@@ -852,7 +898,10 @@ async function startGpuRecorder() {
     }
   }
 
-  state.stream = await buildRecordingStream(state.displayStream, { includeVideo: false });
+  state.stream = await buildRecordingStream(state.displayStream, {
+    includeVideo: false,
+    includeSystemAudio: false
+  });
   if (state.stream.getAudioTracks().length || needsMic) startAudioSegmentRecorder(getAudioMimeType());
   state.captureReady = true;
   state.gpuFallbackAttempted = false;
@@ -984,6 +1033,8 @@ async function saveBufferedClip() {
   const requestedAt = Date.now();
   try {
     debugLog('save-start', { isGpu, requestedAt });
+    await window.clipforge.notifySaveRequest().catch(() => {});
+    queueNotificationSound();
     await stopCurrentRecorder();
     await Promise.allSettled([...state.pendingWrites]);
 

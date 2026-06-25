@@ -26,6 +26,7 @@ contextBridge.exposeInMainWorld('clipforge', {
   startGpuCapture: (payload) => ipcRenderer.invoke('gpu:start', payload),
   stopGpuCapture: () => ipcRenderer.invoke('gpu:stop'),
   saveGpuClip: (payload) => ipcRenderer.invoke('gpu:save-clip', payload),
+  notifySaveRequest: () => ipcRenderer.invoke('clip:notify-save-request'),
   deleteClip: (clipPath) => ipcRenderer.invoke('clip:delete', clipPath),
   minimize: () => ipcRenderer.invoke('window:minimize'),
   hide: () => ipcRenderer.invoke('window:hide'),

@@ -24,12 +24,16 @@ const APP_NAME = 'Papatya';
 const APP_ID = 'com.papatya.cliprecorder';
 app.setName(APP_NAME);
 if (process.platform === 'win32') app.setAppUserModelId(APP_ID);
-const SYSTEM_MUX_VOLUME = '1.0';
-const MIC_MUX_VOLUME = '0.10';
+const AUDIO_BALANCE_TARGET_DB = -20;
+const MIN_BALANCE_TARGET_DB = -26;
+const MAX_BALANCE_TARGET_DB = -18;
+const MAX_MIC_GAIN_DB = 12;
+const MAX_MIC_CUT_DB = -24;
+const MIC_OUTPUT_TRIM_DB = -15;
+const MIC_SYNC_ADVANCE_SECONDS = 0.35;
 const CLIP_AUDIO_FILTER = [
   'aresample=async=1000:first_pts=0',
-  'alimiter=limit=0.99:attack=5:release=50',
-  'apad'
+  'alimiter=limit=0.99:attack=5:release=50'
 ].join(',');
 const QUALITY = {
   480: { width: 854, height: 480, bitrate: '1200k' },
@@ -82,6 +86,7 @@ let systemAudioState = {
   segments: []
 };
 let updateCheckTimer = null;
+const activeFfmpegProcesses = new Set();
 
 const paths = {
   userData: () => app.getPath('userData'),
@@ -210,6 +215,7 @@ function listNotificationSounds() {
       id: 'default',
       name: 'Varsayilan bildirim',
       path: defaultPath,
+      url: pathToFileURL(defaultPath).href,
       exists: fsSync.existsSync(defaultPath),
       builtin: true,
       selected: selectedId === 'default'
@@ -219,6 +225,7 @@ function listNotificationSounds() {
   for (const sound of settings.notificationSounds || []) {
     sounds.push({
       ...sound,
+      url: pathToFileURL(sound.path).href,
       exists: fsSync.existsSync(sound.path),
       builtin: false,
       selected: sound.id === selectedId
@@ -317,8 +324,8 @@ function createOverlayWindow() {
   }
 
   overlayWindow = new BrowserWindow({
-    width: 300,
-    height: 74,
+    width: 328,
+    height: 96,
     show: false,
     frame: false,
     transparent: true,
@@ -347,15 +354,14 @@ function createOverlayWindow() {
   return overlayWindow;
 }
 
-function showClipOverlay(title = 'Klip alindi', detail = 'Papatya kaydetti') {
+function showClipOverlay(title = 'Klip alindi', detail = 'Papatya kaydetti', options = {}) {
   if (!overlayWindow || overlayWindow.isDestroyed()) createOverlayWindow();
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-  const soundUrl = pathToFileURL(selectedNotificationSoundPath()).href;
   overlayWindow.setBounds({
     x: display.bounds.x + 18,
     y: display.bounds.y + 18,
-    width: 300,
-    height: 74
+    width: 328,
+    height: 96
   });
   overlayWindow.showInactive();
   overlayWindow.webContents.executeJavaScript(`
@@ -364,22 +370,13 @@ function showClipOverlay(title = 'Klip alindi', detail = 'Papatya kaydetti') {
       const detail = document.querySelector('.toast span');
       if (title) title.textContent = ${JSON.stringify(title)};
       if (detail) detail.textContent = ${JSON.stringify(detail)};
-      const audio = document.getElementById('tinkSound');
-      if (audio) {
-        const source = ${JSON.stringify(soundUrl)};
-        if (audio.src !== source) audio.src = source;
-        audio.currentTime = 0;
-        audio.volume = 0.30;
-        audio.play().catch(() => {});
-      }
     })();
   `).catch(() => {});
   clearTimeout(showClipOverlay.hideTimer);
   showClipOverlay.hideTimer = setTimeout(() => {
     if (!overlayWindow || overlayWindow.isDestroyed()) return;
     overlayWindow.hide();
-    overlayWindow.close();
-  }, 2200);
+  }, Number(options.hideAfterMs) > 0 ? Number(options.hideAfterMs) : 2200);
 }
 
 async function requestQuit() {
@@ -642,9 +639,21 @@ function normalizedFps(value = settings.fps) {
   return Math.max(15, Math.min(60, Number(value) || 30));
 }
 
-function cfrVideoEncodeArgs({ fps, quality, audio = false }) {
+function formatSeconds(value) {
+  return String(Math.max(0, Number(value) || 0).toFixed(3)).replace(/\.?0+$/, '');
+}
+
+function cfrVideoEncodeArgs({ fps, quality, audio = false, trimStart = 0, duration = null }) {
+  const videoFilters = [];
+  const trimParts = [];
+  if (Number(trimStart) > 0.001) trimParts.push(`start=${formatSeconds(trimStart)}`);
+  if (Number(duration) > 0.001) trimParts.push(`duration=${formatSeconds(duration)}`);
+  if (trimParts.length) videoFilters.push(`trim=${trimParts.join(':')}`);
+  videoFilters.push(`fps=${fps}:round=near`);
+  videoFilters.push('setpts=PTS-STARTPTS');
+
   return [
-    '-vf', `fps=${fps}`,
+    '-vf', videoFilters.join(','),
     '-fps_mode', 'cfr',
     '-r', String(fps),
     '-c:v', 'h264_nvenc',
@@ -986,7 +995,56 @@ function concatListLine(filePath) {
   return `file '${normalized}'`;
 }
 
-function runFfmpeg(args) {
+function stopTrackedFfmpegProcesses() {
+  for (const child of [...activeFfmpegProcesses]) {
+    try {
+      if (!child.killed) child.kill('SIGTERM');
+    } catch {}
+  }
+}
+
+function runFfmpeg(args, options = {}) {
+  const timeoutMs = Number(options.timeoutMs) || 180000;
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, { windowsHide: true });
+    activeFfmpegProcesses.add(child);
+    let stderr = '';
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      logLine('ffmpeg', 'timeout', { timeoutMs, args, stderr: stderr.trim().slice(-800) });
+      try {
+        child.kill('SIGTERM');
+      } catch {}
+      activeFfmpegProcesses.delete(child);
+      reject(new Error('FFmpeg timed out while writing clip'));
+    }, timeoutMs);
+
+    const finish = (error = null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      activeFfmpegProcesses.delete(child);
+      if (error) reject(error);
+      else resolve();
+    };
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+    child.on('error', (error) => {
+      logLine('ffmpeg', 'spawn-error', { message: error.message, ffmpegPath, args });
+      finish(error);
+    });
+    child.on('close', (code) => {
+      if (code === 0) finish();
+      else finish(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
+    });
+  });
+}
+
+function runFfmpegForStderr(args) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffmpegPath, args, { windowsHide: true });
     let stderr = '';
@@ -998,10 +1056,88 @@ function runFfmpeg(args) {
       reject(error);
     });
     child.on('close', (code) => {
-      if (code === 0) resolve();
+      if (code === 0) resolve(stderr);
       else reject(new Error(stderr.trim() || `ffmpeg exited with code ${code}`));
     });
   });
+}
+
+async function detectMeanVolumeDb(filePath) {
+  try {
+    const stderr = await runFfmpegForStderr([
+      '-hide_banner',
+      '-i', filePath,
+      '-vn',
+      '-sn',
+      '-dn',
+      '-af', 'volumedetect',
+      '-f', 'null',
+      'NUL'
+    ]);
+    const match = stderr.match(/mean_volume:\s*(-?\d+(?:\.\d+)?)\s*dB/i);
+    return match ? Number(match[1]) : null;
+  } catch (error) {
+    logLine('audio', 'volume-detect-failed', { filePath, message: error.message });
+    return null;
+  }
+}
+
+function clampDb(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function volumeFilterForGain(gainDb) {
+  const rounded = Math.round(gainDb * 10) / 10;
+  return `volume=${rounded}dB`;
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function removeFileWithRetries(filePath, attempts = 8) {
+  let lastError = null;
+  for (let index = 0; index < attempts; index += 1) {
+    try {
+      await fs.rm(filePath, { force: true });
+      return true;
+    } catch (error) {
+      lastError = error;
+      if (!['EBUSY', 'EPERM', 'EACCES'].includes(error.code)) throw error;
+      stopTrackedFfmpegProcesses();
+      await delay(250 + index * 150);
+    }
+  }
+  throw lastError || new Error('File could not be removed');
+}
+
+async function buildBalancedAudioFilters(systemPath, micPath) {
+  const [systemMean, micMean] = await Promise.all([
+    systemPath ? detectMeanVolumeDb(systemPath) : Promise.resolve(null),
+    micPath ? detectMeanVolumeDb(micPath) : Promise.resolve(null)
+  ]);
+
+  const hasSystem = Number.isFinite(systemMean);
+  const targetDb = hasSystem
+    ? clampDb(systemMean, MIN_BALANCE_TARGET_DB, MAX_BALANCE_TARGET_DB)
+    : AUDIO_BALANCE_TARGET_DB;
+  const systemGainDb = 0;
+  const micGainDb = Number.isFinite(micMean)
+    ? clampDb(targetDb - micMean + MIC_OUTPUT_TRIM_DB, MAX_MIC_CUT_DB, MAX_MIC_GAIN_DB)
+    : 0;
+
+  logLine('audio', 'balance', {
+    systemMean,
+    micMean,
+    targetDb,
+    systemGainDb,
+    micGainDb
+  });
+
+  return {
+    system: volumeFilterForGain(systemGainDb),
+    mic: volumeFilterForGain(micGainDb)
+  };
 }
 
 async function writeClipFile(filePath, inputBuffer, mimeType) {
@@ -1038,7 +1174,6 @@ async function saveBufferClip(payload) {
   await fs.writeFile(listPath, segmentPaths.map(concatListLine).join('\n'));
   await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', filePath]);
   logLine('clip', 'buffer-saved', { filePath, segments: segmentPaths.length });
-  showClipOverlay();
   return { filePath, clips: await listClips() };
 }
 
@@ -1066,13 +1201,30 @@ function syncOffsetSeconds(audioStartAt, videoStartAt) {
   return Math.round((clamped / 1000) * 1000) / 1000;
 }
 
+function audioTimingFilter(offsetSeconds) {
+  const offset = Number(offsetSeconds) || 0;
+  if (offset > 0.015) return `adelay=${Math.round(offset * 1000)}:all=1,asetpts=PTS-STARTPTS`;
+  if (offset < -0.015) return `atrim=start=${Math.round(Math.abs(offset) * 1000) / 1000},asetpts=PTS-STARTPTS`;
+  return 'asetpts=PTS-STARTPTS';
+}
+
+function audioInputChain(inputIndex, gainFilter, offsetSeconds, outputLabel) {
+  return `[${inputIndex}:a]${gainFilter},${audioTimingFilter(offsetSeconds)}[${outputLabel}]`;
+}
+
+function finalClipAudioFilter(durationSeconds) {
+  const duration = formatSeconds(durationSeconds);
+  return `apad=whole_dur=${duration},atrim=duration=${duration},${CLIP_AUDIO_FILTER}`;
+}
+
 async function saveGpuClip(payload) {
   await stopGpuCapture();
   await scanGpuSegments();
   await scanSystemAudioSegments();
   await fs.mkdir(paths.clips(), { recursive: true });
   const requestedAt = Number(payload.requestedAt) || Date.now();
-  const cutoff = requestedAt - Number(settings.clipSeconds) * 1000;
+  const requestedClipSeconds = Math.max(1, Number(settings.clipSeconds) || 30);
+  const cutoff = requestedAt - requestedClipSeconds * 1000;
   const videoSegments = gpuState.segments
     .filter((segment) => segment.endedAt >= cutoff && streamStartMs(segment) <= requestedAt)
     .sort((a, b) => a.at - b.at);
@@ -1086,6 +1238,10 @@ async function saveGpuClip(payload) {
   const outputFps = normalizedFps(settings.fps);
   const outputQuality = QUALITY[String(settings.quality || '720').toLowerCase()] || QUALITY[720];
   await concatFiles(videoSegments.map((segment) => segment.path), tempVideoPath);
+  const firstVideoStartMs = streamStartMs(videoSegments[0]);
+  const clipStartMs = Math.max(cutoff, firstVideoStartMs);
+  const clipDurationSeconds = Math.max(0.1, Math.min(requestedClipSeconds, (requestedAt - clipStartMs) / 1000));
+  const videoTrimStartSeconds = Math.max(0, (clipStartMs - firstVideoStartMs) / 1000);
 
   const systemAudioEntries = systemAudioState.segments
     .filter((segment) => segment.endedAt >= cutoff && streamStartMs(segment) <= requestedAt)
@@ -1106,7 +1262,13 @@ async function saveGpuClip(payload) {
       '-fflags', '+genpts',
       '-i', tempVideoPath,
       '-map', '0:v:0',
-      ...cfrVideoEncodeArgs({ fps: outputFps, quality: outputQuality, audio: false }),
+      ...cfrVideoEncodeArgs({
+        fps: outputFps,
+        quality: outputQuality,
+        audio: false,
+        trimStart: videoTrimStartSeconds,
+        duration: clipDurationSeconds
+      }),
       '-movflags', '+faststart',
       filePath
     ]);
@@ -1120,50 +1282,67 @@ async function saveGpuClip(payload) {
     if (tempSystemAudioPath) await concatFiles(systemAudioChunks, tempSystemAudioPath);
     if (tempMicAudioPath) await concatFiles(micAudioChunks, tempMicAudioPath);
     try {
+      const audioBalance = await buildBalancedAudioFilters(tempSystemAudioPath, tempMicAudioPath);
       const muxArgs = ['-y', '-fflags', '+genpts'];
       muxArgs.push('-i', tempVideoPath);
       const filterInputs = [];
       let audioInputIndex = 1;
+      let systemOffset = null;
+      let micOffset = null;
+      let micAdjustedOffset = null;
       if (tempSystemAudioPath) {
-        const offset = syncOffsetSeconds(streamStartMs(systemAudioEntries[0]), streamStartMs(videoSegments[0]));
-        if (offset > 0) muxArgs.push('-itsoffset', String(offset));
+        systemOffset = syncOffsetSeconds(streamStartMs(systemAudioEntries[0]), clipStartMs);
         muxArgs.push('-i', tempSystemAudioPath);
-        filterInputs.push(`[${audioInputIndex}:a]volume=${SYSTEM_MUX_VOLUME}[sys]`);
+        filterInputs.push(audioInputChain(audioInputIndex, audioBalance.system, systemOffset, 'sys'));
         audioInputIndex += 1;
       }
       if (tempMicAudioPath) {
-        const offset = syncOffsetSeconds(streamStartMs(micAudioEntries[0]), streamStartMs(videoSegments[0]));
-        if (offset > 0) muxArgs.push('-itsoffset', String(offset));
+        micOffset = syncOffsetSeconds(streamStartMs(micAudioEntries[0]), clipStartMs);
+        micAdjustedOffset = micOffset - MIC_SYNC_ADVANCE_SECONDS;
         muxArgs.push('-i', tempMicAudioPath);
-        filterInputs.push(`[${audioInputIndex}:a]volume=${MIC_MUX_VOLUME}[mic]`);
+        filterInputs.push(audioInputChain(audioInputIndex, audioBalance.mic, micAdjustedOffset, 'mic'));
         audioInputIndex += 1;
       }
 
-      let audioMap = '1:a:0';
+      logLine('audio', 'sync', {
+        systemOffset,
+        micOffset,
+        micSyncAdvance: MIC_SYNC_ADVANCE_SECONDS,
+        micAdjustedOffset,
+        clipDurationSeconds,
+        videoTrimStartSeconds
+      });
+
+      let audioMap = '[aout]';
       if (tempSystemAudioPath && tempMicAudioPath) {
         const filter = [
           ...filterInputs,
-          `[sys][mic]amix=inputs=2:duration=longest:normalize=0,${CLIP_AUDIO_FILTER}[aout]`
+          `[sys][mic]amix=inputs=2:duration=longest:normalize=0,${finalClipAudioFilter(clipDurationSeconds)}[aout]`
         ].join(';');
         muxArgs.push('-filter_complex', filter);
-        audioMap = '[aout]';
       } else if (tempSystemAudioPath) {
-        muxArgs.push('-filter:a', `volume=${SYSTEM_MUX_VOLUME},${CLIP_AUDIO_FILTER}`);
+        muxArgs.push('-filter_complex', [...filterInputs, `[sys]${finalClipAudioFilter(clipDurationSeconds)}[aout]`].join(';'));
       } else {
-        muxArgs.push('-filter:a', `volume=${MIC_MUX_VOLUME},${CLIP_AUDIO_FILTER}`);
+        muxArgs.push('-filter_complex', [...filterInputs, `[mic]${finalClipAudioFilter(clipDurationSeconds)}[aout]`].join(';'));
       }
 
       muxArgs.push(
         '-map', '0:v:0',
         '-map', audioMap,
-        ...cfrVideoEncodeArgs({ fps: outputFps, quality: outputQuality, audio: true }),
+        ...cfrVideoEncodeArgs({
+          fps: outputFps,
+          quality: outputQuality,
+          audio: true,
+          trimStart: videoTrimStartSeconds,
+          duration: clipDurationSeconds
+        }),
         '-c:a', 'aac',
         '-b:a', '320k',
         '-ar', '48000',
         '-ac', '2',
         '-avoid_negative_ts', 'make_zero',
         '-movflags', '+faststart',
-        '-shortest',
+        '-t', formatSeconds(clipDurationSeconds),
         filePath
       );
       await runFfmpeg(muxArgs);
@@ -1179,9 +1358,9 @@ async function saveGpuClip(payload) {
     videoSegments: videoSegments.length,
     audioSegments: audioChunks.length,
     systemAudioSegments: systemAudioChunks.length,
-    micAudioSegments: micAudioChunks.length
+    micAudioSegments: micAudioChunks.length,
+    clipDurationSeconds
   });
-  showClipOverlay();
   return {
     filePath,
     clips: await listClips(),
@@ -1228,6 +1407,8 @@ async function trimClip(payload) {
   const outputPath = path.join(paths.clips(), `${sanitizeFilePart(parsed.name)}-kirp-${stamp}${isMp4 ? '.mp4' : '.webm'}`);
   const crop = normalizeCrop(payload.crop);
   const duration = end - start;
+  const targetFps = normalizedFps(settings.fps);
+  const videoFilters = [];
   const args = [
     '-y',
     '-ss', String(start),
@@ -1236,11 +1417,13 @@ async function trimClip(payload) {
   ];
 
   if (crop && (crop.x > 0.001 || crop.y > 0.001 || crop.w < 0.999 || crop.h < 0.999)) {
-    args.push(
-      '-vf',
+    videoFilters.push(
       `crop=trunc(iw*${crop.w}/2)*2:trunc(ih*${crop.h}/2)*2:trunc(iw*${crop.x}/2)*2:trunc(ih*${crop.y}/2)*2`
     );
   }
+  videoFilters.push(`fps=${targetFps}:round=near`);
+  videoFilters.push('setpts=PTS-STARTPTS');
+  args.push('-vf', videoFilters.join(','));
 
   if (isMp4) {
     args.push(
@@ -1249,8 +1432,19 @@ async function trimClip(payload) {
       '-rc', 'vbr',
       '-cq', '23',
       '-b:v', '6M',
+      '-maxrate', '6M',
+      '-bufsize', '6M',
+      '-g', String(normalizedFps(settings.fps) * 2),
+      '-bf', '0',
+      '-rc-lookahead', '0',
+      '-fps_mode', 'cfr',
+      '-r', String(targetFps),
+      '-video_track_timescale', '90000',
+      '-af', 'aresample=async=1000:first_pts=0',
       '-c:a', 'aac',
       '-b:a', '192k',
+      '-ar', '48000',
+      '-ac', '2',
       '-avoid_negative_ts', 'make_zero',
       outputPath
     );
@@ -1508,14 +1702,17 @@ function setupIpc() {
     const title = sanitizeFilePart(payload.title || `${APP_NAME}-${stamp}`);
     const filePath = path.join(paths.clips(), `${title}.webm`);
     await writeClipFile(filePath, Buffer.from(payload.buffer), payload.mimeType);
-    showClipOverlay();
     return { filePath, clips: await listClips() };
+  });
+  ipcMain.handle('clip:notify-save-request', () => {
+    showClipOverlay('Klip alindi', 'Kaydediliyor...', { hideAfterMs: 1800 });
+    return true;
   });
 
   ipcMain.handle('clip:delete', async (_event, clipPath) => {
     const resolved = path.resolve(clipPath);
     if (!isInsideClipDir(resolved)) throw new Error('Invalid clip path');
-    await fs.rm(resolved, { force: true });
+    await removeFileWithRetries(resolved);
     return listClips();
   });
   ipcMain.handle('clip:rename', (_event, payload) => renameClip(payload));
@@ -1591,6 +1788,7 @@ if (!singleInstanceLock) {
     setupCaptureHandler();
     setupIpc();
     createWindow();
+    createOverlayWindow();
     createTray();
     registerHotkey();
     setupAutoUpdates();

@@ -10,13 +10,14 @@ body {
 
 .toast {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
-  width: 292px;
-  height: 66px;
+  box-sizing: border-box;
+  width: 320px;
+  min-height: 88px;
   margin: 4px;
-  padding: 10px 14px;
-  border-radius: 8px;
+  padding: 12px 14px;
+  border-radius: 12px;
   color: #fff;
   background: rgba(8, 10, 14, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.14);
@@ -24,16 +25,18 @@ body {
 }
 
 img {
-  width: 42px;
-  height: 42px;
+  width: 44px;
+  height: 44px;
   border-radius: 8px;
   object-fit: cover;
+  flex: 0 0 auto;
 }
 
 strong,
 span {
   display: block;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 strong {
@@ -45,4 +48,5 @@ span {
   margin-top: 2px;
   color: #d6d8dc;
   font-size: 13px;
+  line-height: 18px;
 }
