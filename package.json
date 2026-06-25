@@ -1,6 +1,6 @@
 {
   "name": "papatya",
-  "version": "1.0.28",
+  "version": "1.0.30",
   "description": "Papatya",
   "main": "src/main.js",
   "scripts": {

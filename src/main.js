@@ -43,6 +43,8 @@ const QUALITY = {
 };
 const GPU_SEGMENT_SECONDS = 2;
 const GPU_SEGMENT_MS = GPU_SEGMENT_SECONDS * 1000;
+const BACKGROUND_CAPTURE_MAX_FPS = 15;
+const BACKGROUND_CAPTURE_MAX_FPS_2K = 12;
 const SYSTEM_AUDIO_SEGMENT_SECONDS = 1;
 const SYSTEM_AUDIO_SEGMENT_MS = SYSTEM_AUDIO_SEGMENT_SECONDS * 1000;
 const DEFAULT_SETTINGS = {
@@ -76,7 +78,8 @@ let gpuState = {
   process: null,
   scanner: null,
   stopping: false,
-  segments: []
+  segments: [],
+  captureFps: null
 };
 let systemAudioState = {
   sessionId: Date.now(),
@@ -639,6 +642,11 @@ function normalizedFps(value = settings.fps) {
   return Math.max(15, Math.min(60, Number(value) || 30));
 }
 
+function backgroundCaptureFps(requestedFps, qualityKey) {
+  const maxFps = qualityKey === '2k' ? BACKGROUND_CAPTURE_MAX_FPS_2K : BACKGROUND_CAPTURE_MAX_FPS;
+  return Math.max(15, Math.min(normalizedFps(requestedFps), maxFps));
+}
+
 function formatSeconds(value) {
   return String(Math.max(0, Number(value) || 0).toFixed(3)).replace(/\.?0+$/, '');
 }
@@ -898,13 +906,15 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
 
   const qualityKey = String(settings.quality || '720').toLowerCase();
   const quality = QUALITY[qualityKey] || QUALITY[720];
-  const fps = normalizedFps(settings.fps);
+  const requestedFps = normalizedFps(settings.fps);
+  const fps = backgroundCaptureFps(requestedFps, qualityKey);
+  gpuState.captureFps = fps;
   const pattern = path.join(paths.gpuBuffer(), `${gpuState.sessionId}-%05d.mp4`);
   const maxrate = quality.bitrate;
   const bufsize = maxrate;
   const backend = forcedBackend || chooseGpuBackend(qualityKey, settings.captureBackend);
   const args = buildGpuCaptureArgs({ backend, quality, fps, maxrate, bufsize, pattern });
-  logLine('gpu', 'start', { backend, quality: qualityKey, fps, pattern });
+  logLine('gpu', 'start', { backend, quality: qualityKey, requestedFps, captureFps: fps, pattern });
 
   const child = spawn(ffmpegPath, args, { windowsHide: true });
   child.captureBackend = backend;
@@ -1235,7 +1245,7 @@ async function saveGpuClip(payload) {
   const title = sanitizeFilePart(payload.title || `${APP_NAME}-${stamp}`);
   const filePath = path.join(paths.clips(), `${title}.mp4`);
   const tempVideoPath = path.join(paths.gpuBuffer(), `${gpuState.sessionId}-video-${stamp}.mp4`);
-  const outputFps = normalizedFps(settings.fps);
+  const outputFps = Math.min(normalizedFps(settings.fps), gpuState.captureFps || normalizedFps(settings.fps));
   const outputQuality = QUALITY[String(settings.quality || '720').toLowerCase()] || QUALITY[720];
   await concatFiles(videoSegments.map((segment) => segment.path), tempVideoPath);
   const firstVideoStartMs = streamStartMs(videoSegments[0]);
