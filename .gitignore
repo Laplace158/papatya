@@ -2,7 +2,8 @@ node_modules/
 release/
 dist/
 out/
+Video_Codec_SDK_*/
+native/PapatyaNativeCapture/build/
 *.log
 .DS_Store
 Thumbs.db
-

@@ -6,11 +6,24 @@ const QUALITY = {
 };
 
 const SEGMENT_MS = 5000;
-const AUDIO_SEGMENT_MS = 3000;
+const AUDIO_SEGMENT_MS = 1000;
 const AUDIO_BITRATE = 320_000;
 const SYSTEM_AUDIO_GAIN = 1.0;
 const MIC_AUDIO_GAIN = 1.0;
 const NOTIFICATION_SOUND_DELAY_MS = 1000;
+const TARGET_APP_BLOCKLIST = new Set([
+  'applicationframehost',
+  'explorer',
+  'nvidia overlay',
+  'papatya',
+  'searchhost',
+  'shellexperiencehost',
+  'startmenuexperiencehost',
+  'systemsettings',
+  'taskmgr',
+  'textinputhost',
+  'windowsterminal'
+]);
 let notificationAudio = null;
 let notificationAudioUrl = '';
 let notificationTimer = null;
@@ -63,6 +76,8 @@ const state = {
   saving: false,
   stoppingForSave: false,
   captureReady: false,
+  nativeCapture: false,
+  waitingForGame: false,
   gpuFallbackAttempted: false,
   startPromise: null,
   lastSaveAttemptAt: 0,
@@ -185,9 +200,20 @@ function clearPlayerSource(player) {
 
 function loadClipIntoPlayer(player, clip) {
   clearPlayerSource(player);
+  player.preload = 'metadata';
   player.dataset.fallbackTried = '0';
   player.src = clip.url;
   player.load();
+}
+
+function clearClipPreviewAfterSave() {
+  clearPlayerSource($('clipPlayer'));
+  state.selectedClip = null;
+  $('selectedClip').textContent = 'Bir klip sec';
+  $('selectedClip').title = '';
+  $('emptyPlayer').classList.remove('hidden');
+  setClipNameInput(null);
+  highlightSelected();
 }
 
 function shotPreviewBounds() {
@@ -349,10 +375,12 @@ function updateStats() {
   $('qualityInput').value = s.quality;
   $('fpsInput').value = String(s.fps);
   $('encoderInput').value = s.encoderMode || 'gpu';
+  $('captureTargetModeInput').value = s.captureTargetMode || 'game';
   $('audioInput').checked = Boolean(s.includeAudio);
   $('micInput').checked = Boolean(s.includeMic);
   $('micDeviceInput').value = s.micDeviceId || 'default';
   renderAudioApps(state.audioApps);
+  renderGameApps(state.audioApps);
   renderNotificationSounds(state.notificationSounds);
 }
 
@@ -510,6 +538,7 @@ async function populateMicrophones() {
 async function loadAudioApps() {
   state.audioApps = await window.clipforge.listAudioApps();
   renderAudioApps(state.audioApps);
+  renderGameApps(state.audioApps);
 }
 
 async function loadNotificationSounds() {
@@ -581,6 +610,71 @@ function updateAudioFilterNote() {
   note.textContent = selected
     ? `${selected} programın sesi kayda alınmayacak. Kaydetmek için Uygula'ya bas.`
     : 'Tik attığın programların sesi kayda alınmaz.';
+}
+
+function renderGameApps(apps) {
+  const select = $('gameProcessInput');
+  if (!select) return;
+  const currentName = state.settings?.gameProcessName || '';
+  const currentTitle = state.settings?.gameProcessTitle || '';
+  const unique = [];
+  const seen = new Set();
+  for (const app of apps || []) {
+    const key = String(app.name || '').toLowerCase();
+    if (!key || seen.has(key) || TARGET_APP_BLOCKLIST.has(key)) continue;
+    seen.add(key);
+    unique.push(app);
+  }
+
+  select.innerHTML = '';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = 'Otomatik algıla';
+  select.appendChild(none);
+
+  if (currentName && !seen.has(currentName.toLowerCase())) {
+    const option = document.createElement('option');
+    option.value = currentName;
+    option.dataset.title = currentTitle || currentName;
+    option.textContent = `${currentName} (kayıtlı)`;
+    select.appendChild(option);
+  }
+
+  for (const app of unique) {
+    const option = document.createElement('option');
+    option.value = app.name;
+    option.dataset.title = app.title || app.name;
+    option.textContent = `${app.name} - ${app.title || app.name}`;
+    select.appendChild(option);
+  }
+
+  select.value = [...select.options].some((option) => option.value === currentName) ? currentName : '';
+  updateGameTargetNote();
+}
+
+function selectedGameTarget() {
+  const select = $('gameProcessInput');
+  const option = select?.selectedOptions?.[0];
+  return {
+    name: select?.value || '',
+    title: option?.dataset?.title || option?.textContent || ''
+  };
+}
+
+function updateGameTargetNote() {
+  const note = $('gameTargetNote');
+  if (!note) return;
+  const mode = $('captureTargetModeInput')?.value || state.settings?.captureTargetMode || 'auto';
+  const target = selectedGameTarget();
+  if (mode === 'desktop') {
+    note.textContent = 'PC kaydı seçiliyken Papatya masaüstünü direkt kaydeder.';
+  } else if (target.name) {
+    note.textContent = `${target.name} öndeyken buffer başlar, başka yere geçince durur.`;
+  } else if (mode === 'game') {
+    note.textContent = 'Hedef seçmezsen Papatya sadece oyun benzeri aktif pencereyi otomatik yakalar.';
+  } else {
+    note.textContent = 'Otomatik modda masaüstü kaydı başlamaz, aktif oyun bulununca kayıt başlar.';
+  }
 }
 
 function renderNotificationSounds(sounds) {
@@ -752,9 +846,30 @@ function stopCurrentRecorder() {
   });
 }
 
+function flushCurrentRecorderChunk() {
+  if (!state.recorder || state.recorder.state !== 'recording' || typeof state.recorder.requestData !== 'function') {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const recorder = state.recorder;
+    const timer = setTimeout(resolve, 700);
+    recorder.addEventListener('dataavailable', () => {
+      clearTimeout(timer);
+      setTimeout(resolve, 0);
+    }, { once: true });
+    try {
+      recorder.requestData();
+    } catch {
+      clearTimeout(timer);
+      resolve();
+    }
+  });
+}
+
 function startSegmentRecorder(mimeType, bitrate) {
   if (!state.stream || state.stream.getTracks().every((track) => track.readyState === 'ended')) return;
-  const segmentStartedAt = Date.now();
+  let segmentStartedAt = Date.now();
 
   state.recorder = new MediaRecorder(state.stream, {
     mimeType,
@@ -766,8 +881,10 @@ function startSegmentRecorder(mimeType, bitrate) {
     if (!event.data || event.data.size === 0) return;
 
     const at = Date.now();
+    const startedAt = segmentStartedAt;
+    segmentStartedAt = at;
     const id = String(++state.chunkId);
-    state.chunks.push({ id, at, startedAt: segmentStartedAt, endedAt: at });
+    state.chunks.push({ id, at, startedAt, endedAt: at });
 
     const keepMs = (Number(state.settings.clipSeconds) * 1000) + SEGMENT_MS * 2;
     const cutoff = Date.now() - keepMs;
@@ -777,7 +894,7 @@ function startSegmentRecorder(mimeType, bitrate) {
       .then((buffer) => window.clipforge.writeBufferChunk({
         id,
         at,
-        startedAt: segmentStartedAt,
+        startedAt,
         endedAt: at,
         mimeType: state.recorder.mimeType || event.data.type || 'video/webm',
         buffer
@@ -806,7 +923,7 @@ function startSegmentRecorder(mimeType, bitrate) {
 
 function startAudioSegmentRecorder(mimeType) {
   if (!state.stream || !state.stream.getAudioTracks().length) return;
-  const segmentStartedAt = Date.now();
+  let segmentStartedAt = Date.now();
 
   state.recorder = new MediaRecorder(state.stream, {
     mimeType,
@@ -817,8 +934,10 @@ function startAudioSegmentRecorder(mimeType) {
     if (!event.data || event.data.size === 0) return;
 
     const at = Date.now();
+    const startedAt = segmentStartedAt;
+    segmentStartedAt = at;
     const id = String(++state.chunkId);
-    state.chunks.push({ id, at, startedAt: segmentStartedAt, endedAt: at });
+    state.chunks.push({ id, at, startedAt, endedAt: at });
 
     const keepMs = (Number(state.settings.clipSeconds) * 1000) + AUDIO_SEGMENT_MS * 8;
     const cutoff = Date.now() - keepMs;
@@ -828,7 +947,7 @@ function startAudioSegmentRecorder(mimeType) {
       .then((buffer) => window.clipforge.writeBufferChunk({
         id,
         at,
-        startedAt: segmentStartedAt,
+        startedAt,
         endedAt: at,
         mimeType: state.recorder.mimeType || event.data.type || 'audio/webm',
         buffer
@@ -857,6 +976,7 @@ function startAudioSegmentRecorder(mimeType) {
 
 async function startGpuRecorder() {
   debugLog('start-gpu-recorder', { includeAudio: state.settings.includeAudio, includeMic: state.settings.includeMic });
+  state.nativeCapture = false;
   state.stoppingForSave = true;
   await stopCurrentRecorder();
   state.stoppingForSave = false;
@@ -866,12 +986,38 @@ async function startGpuRecorder() {
   state.pendingWrites.clear();
   state.chunks = [];
   state.chunkId = 0;
+  state.waitingForGame = false;
   await window.clipforge.resetBuffer();
-  await window.clipforge.startGpuCapture({
+  const captureResult = await window.clipforge.startGpuCapture({
     quality: $('qualityInput')?.value || state.settings.quality,
     fps: Number($('fpsInput')?.value || state.settings.fps),
     clipSeconds: Number($('durationInput')?.value || state.settings.clipSeconds)
   });
+
+  if (captureResult?.mode === 'waiting') {
+    state.nativeCapture = false;
+    state.waitingForGame = true;
+    state.captureReady = true;
+    state.gpuFallbackAttempted = false;
+    setRecorderStatus('Oyun bekleniyor', captureResult.message || 'Secilen oyun acilinca kayit baslar.', false);
+    return;
+  }
+
+  if (captureResult?.mode === 'native') {
+    state.nativeCapture = true;
+    state.waitingForGame = false;
+    state.captureReady = true;
+    state.gpuFallbackAttempted = false;
+    const nativeDetail = state.settings.includeAudio && state.settings.includeMic
+      ? 'native video + system audio + mic'
+      : state.settings.includeAudio
+        ? 'native video + system audio'
+        : state.settings.includeMic
+          ? 'native video + mic'
+          : 'native video only';
+    setRecorderStatus('Native Recording', nativeDetail, true);
+    return;
+  }
 
   const q = QUALITY[state.settings.quality] || QUALITY[720];
   const needsSystemAudio = Boolean(state.settings.includeAudio);
@@ -1022,6 +1168,11 @@ async function saveBufferedClip() {
     state.saving = false;
     return;
   }
+  if (state.waitingForGame) {
+    toast('Oyun acilinca klip buffer baslayacak.');
+    state.saving = false;
+    return;
+  }
   if (!isGpu && !state.chunks.length) {
     toast('Buffer henuz hazir degil.');
     debugLog('save-skipped-empty-buffer', { mode: 'compat' });
@@ -1029,13 +1180,17 @@ async function saveBufferedClip() {
     return;
   }
 
-  state.stoppingForSave = true;
   const requestedAt = Date.now();
   try {
     debugLog('save-start', { isGpu, requestedAt });
     await window.clipforge.notifySaveRequest().catch(() => {});
     queueNotificationSound();
-    await stopCurrentRecorder();
+    if (isGpu) {
+      await flushCurrentRecorderChunk();
+    } else {
+      state.stoppingForSave = true;
+      await stopCurrentRecorder();
+    }
     await Promise.allSettled([...state.pendingWrites]);
 
     const title = `Papatya-${new Date().toISOString().replace(/[:.]/g, '-')}`;
@@ -1044,27 +1199,21 @@ async function saveBufferedClip() {
       : await window.clipforge.saveBufferedClip({ title });
     state.clips = result.clips;
     renderLibraryPane();
-    if (result.clips[0]) previewClip(result.clips[0], false);
+    clearClipPreviewAfterSave();
     debugLog('save-success', { isGpu, clipCount: result.clips.length });
     toast(result.audioSegments === 0 ? 'Klip kaydedildi, ses yok.' : 'Klip kaydedildi.');
   } catch (error) {
-    state.captureReady = false;
+    state.captureReady = state.waitingForGame;
     debugLog('save-failed', { isGpu, message: error.message });
     toast(`Kayit basarisiz: ${error.message}`);
   } finally {
     state.stoppingForSave = false;
     state.saving = false;
-    if (isGpu) {
-      await window.clipforge.startGpuCapture({
-        quality: $('qualityInput')?.value || state.settings.quality,
-        fps: Number($('fpsInput')?.value || state.settings.fps),
-        clipSeconds: Number($('durationInput')?.value || state.settings.clipSeconds)
-      }).catch(() => {});
-    }
-    if (state.stream) {
+    if (!isGpu && state.stream) {
       const q = QUALITY[state.settings.quality] || QUALITY[720];
-      if (isGpu) startAudioSegmentRecorder(getAudioMimeType());
-      else startSegmentRecorder(getMimeType(), q.bitrate);
+      startSegmentRecorder(getMimeType(), q.bitrate);
+      state.captureReady = true;
+    } else if (isGpu) {
       state.captureReady = true;
     }
   }
@@ -1806,6 +1955,7 @@ function switchView(view) {
 }
 
 async function applySettings() {
+  const gameTarget = selectedGameTarget();
   const next = {
     hotkey: $('hotkeyInput').value.trim() || 'F8',
     screenshotHotkey: state.settings?.screenshotHotkey || 'F9',
@@ -1813,6 +1963,10 @@ async function applySettings() {
     quality: $('qualityInput').value,
     fps: Number($('fpsInput').value),
     encoderMode: $('encoderInput').value,
+    captureTargetMode: $('captureTargetModeInput').value,
+    desktopCaptureConfirmed: $('captureTargetModeInput').value === 'desktop',
+    gameProcessName: gameTarget.name,
+    gameProcessTitle: gameTarget.title,
     includeAudio: $('audioInput').checked,
     includeMic: $('micInput').checked,
     micDeviceId: $('micDeviceInput').value || 'default',
@@ -1853,6 +2007,9 @@ function bindUi() {
   });
   $('saveSettingsBtn').addEventListener('click', applySettings);
   $('refreshAudioAppsBtn').addEventListener('click', loadAudioApps);
+  $('refreshGameAppsBtn').addEventListener('click', loadAudioApps);
+  $('captureTargetModeInput').addEventListener('change', updateGameTargetNote);
+  $('gameProcessInput').addEventListener('change', updateGameTargetNote);
   $('addSoundBtn').addEventListener('click', addNotificationSound);
   $('deleteSoundBtn').addEventListener('click', deleteSelectedNotificationSound);
   $('minimizeBtn').addEventListener('click', () => window.clipforge.minimize());
@@ -1962,7 +2119,24 @@ async function boot() {
     if (!screenshotRegistered) failed.push(screenshotHotkey || 'F9');
     $('settingsNote').textContent = `${failed.join(', ')} kisayolu baska bir uygulama tarafindan kullaniliyor.`;
   });
-  window.clipforge.onGpuStatus(({ ok, message }) => {
+  window.clipforge.onGpuStatus(({ ok, mode, message }) => {
+    if (ok && mode === 'waiting') {
+      state.waitingForGame = true;
+      state.captureReady = true;
+      setRecorderStatus('Oyun bekleniyor', message || 'Secilen oyun acilinca kayit baslar.', false);
+      if (message) $('settingsNote').textContent = message;
+      return;
+    }
+    if (ok && (mode === 'native' || mode === 'gpu')) {
+      state.waitingForGame = false;
+      state.nativeCapture = mode === 'native';
+      state.captureReady = true;
+      if (message) {
+        setRecorderStatus(mode === 'native' ? 'Native Recording' : 'GPU Recording', message, true);
+        $('settingsNote').textContent = message;
+      }
+      return;
+    }
     if (!ok) {
       state.captureReady = false;
       debugLog('gpu-status-failed', { message, encoderMode: state.settings?.encoderMode });

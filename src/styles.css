@@ -548,6 +548,7 @@ select:focus {
   height: 18px;
 }
 
+.target-tools,
 .audio-tools {
   display: grid;
   gap: 10px;
@@ -582,10 +583,23 @@ select:focus {
   border-color: rgba(241, 200, 75, 0.42);
 }
 
+.target-tools small,
 .audio-tools small {
   line-height: 1.35;
 }
 
+.target-tools {
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(241, 200, 75, 0.055);
+  border: 1px solid rgba(241, 200, 75, 0.18);
+}
+
+.target-tools .field {
+  margin-bottom: 0;
+}
+
+.target-tools-head,
 .audio-tools-head {
   display: flex;
   align-items: center;
@@ -593,6 +607,7 @@ select:focus {
   gap: 10px;
 }
 
+.target-tools-head .secondary,
 .audio-tools-head .secondary {
   height: 32px;
   padding: 0 12px;

@@ -91,6 +91,22 @@
                 <strong>Kayıt ayarları</strong>
                 <small>Değiştirince Uygula</small>
               </div>
+              <div class="target-tools">
+                <label class="field">
+                  <span>Kayıt hedefi</span>
+                  <select id="captureTargetModeInput">
+                    <option value="game">Oyun/uygulama bekle</option>
+                    <option value="auto">Otomatik algıla</option>
+                    <option value="desktop">PC kaydı</option>
+                  </select>
+                </label>
+                <div class="target-tools-head">
+                  <strong>Klip alınacak oyun / uygulama</strong>
+                  <button id="refreshGameAppsBtn" class="secondary" type="button">Yenile</button>
+                </div>
+                <select id="gameProcessInput"></select>
+                <small id="gameTargetNote">Seçili hedef açılana kadar kayıt motoru bekler.</small>
+              </div>
               <label class="field">
                 <span>Kısayol</span>
                 <input id="hotkeyInput" value="F8" />
@@ -168,7 +184,7 @@
                 <button id="refreshClipsBtn" class="secondary">Yenile</button>
               </div>
               <div class="player-pane">
-                <video id="clipPlayer" controls preload="auto"></video>
+                <video id="clipPlayer" controls preload="metadata"></video>
                 <img id="shotPlayer" alt="" />
                 <div id="emptyPlayer" class="empty-player">Sağdaki listeden klibe tek tıkla</div>
               </div>

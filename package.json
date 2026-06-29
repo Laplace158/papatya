@@ -1,6 +1,6 @@
 {
   "name": "papatya",
-  "version": "1.0.30",
+  "version": "1.0.43",
   "description": "Papatya",
   "main": "src/main.js",
   "scripts": {
@@ -8,9 +8,13 @@
     "shortcuts": "powershell -ExecutionPolicy Bypass -File scripts/create-shortcuts.ps1",
     "repair-clips": "node scripts/repair-clips.js",
     "sync-publish": "node scripts/sync-publish-config.js",
+    "native:build": "powershell -ExecutionPolicy Bypass -File scripts/build-native-capture.ps1",
     "check": "node --check scripts/start-electron.js && node --check scripts/repair-clips.js && node --check src/main.js && node --check src/preload.js && node --check src/renderer.js",
+    "prepack": "npm run native:build",
     "pack": "electron-builder --win nsis",
+    "predist": "npm run native:build",
     "dist": "node scripts/sync-publish-config.js && electron-builder --win nsis --publish never",
+    "predist:github": "npm run native:build",
     "dist:github": "node scripts/sync-publish-config.js && electron-builder --win nsis --publish always"
   },
   "keywords": [
@@ -34,7 +38,8 @@
     "productName": "Papatya",
     "asar": true,
     "asarUnpack": [
-      "assets/audio-loopback/**"
+      "assets/audio-loopback/**",
+      "assets/native-capture/**"
     ],
     "files": [
       "src/**/*",
@@ -59,7 +64,7 @@
       "artifactName": "Papatya-Setup-${version}.${ext}",
       "executableName": "Papatya",
       "icon": "assets/papatya.ico",
-      "requestedExecutionLevel": "highestAvailable"
+      "requestedExecutionLevel": "asInvoker"
     },
     "nsis": {
       "oneClick": false,

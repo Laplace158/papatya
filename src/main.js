@@ -30,7 +30,7 @@ const MAX_BALANCE_TARGET_DB = -18;
 const MAX_MIC_GAIN_DB = 12;
 const MAX_MIC_CUT_DB = -24;
 const MIC_OUTPUT_TRIM_DB = -15;
-const MIC_SYNC_ADVANCE_SECONDS = 0.35;
+const MIC_SYNC_ADVANCE_SECONDS = 0.05;
 const CLIP_AUDIO_FILTER = [
   'aresample=async=1000:first_pts=0',
   'alimiter=limit=0.99:attack=5:release=50'
@@ -41,12 +41,15 @@ const QUALITY = {
   1080: { width: 1920, height: 1080, bitrate: '6000k' },
   '2k': { width: 2560, height: 1440, bitrate: '10000k' }
 };
-const GPU_SEGMENT_SECONDS = 2;
+const GPU_SEGMENT_SECONDS = 1;
 const GPU_SEGMENT_MS = GPU_SEGMENT_SECONDS * 1000;
-const BACKGROUND_CAPTURE_MAX_FPS = 15;
-const BACKGROUND_CAPTURE_MAX_FPS_2K = 12;
+const FINALIZED_SEGMENT_AGE_MS = 300;
+const BACKGROUND_CAPTURE_MAX_FPS = 30;
+const BACKGROUND_CAPTURE_MAX_FPS_2K = 24;
 const SYSTEM_AUDIO_SEGMENT_SECONDS = 1;
 const SYSTEM_AUDIO_SEGMENT_MS = SYSTEM_AUDIO_SEGMENT_SECONDS * 1000;
+const GAME_POLL_MS = 2500;
+const CAPTURE_TARGET_MODES = new Set(['auto', 'desktop', 'game']);
 const DEFAULT_SETTINGS = {
   hotkey: 'F8',
   screenshotHotkey: 'F9',
@@ -59,6 +62,10 @@ const DEFAULT_SETTINGS = {
   includeMic: false,
   micDeviceId: 'default',
   excludedAudioApps: [],
+  captureTargetMode: 'game',
+  desktopCaptureConfirmed: false,
+  gameProcessName: '',
+  gameProcessTitle: '',
   notificationSoundId: 'default',
   notificationSounds: []
 };
@@ -81,6 +88,24 @@ let gpuState = {
   segments: [],
   captureFps: null
 };
+let nativeCaptureState = {
+  process: null,
+  lineBuffer: '',
+  nextId: 1,
+  pending: new Map(),
+  ready: false,
+  running: false,
+  lastError: null
+};
+let captureGateState = {
+  timer: null,
+  desired: false,
+  active: false,
+  starting: false,
+  forcedBackend: null,
+  lastMatchedName: '',
+  lastStatus: ''
+};
 let systemAudioState = {
   sessionId: Date.now(),
   process: null,
@@ -90,6 +115,7 @@ let systemAudioState = {
 };
 let updateCheckTimer = null;
 const activeFfmpegProcesses = new Set();
+let clipSavesInFlight = 0;
 
 const paths = {
   userData: () => app.getPath('userData'),
@@ -101,6 +127,13 @@ const paths = {
   buffer: () => path.join(app.getPath('userData'), 'rolling-buffer'),
   gpuBuffer: () => path.join(app.getPath('userData'), 'gpu-buffer'),
   systemAudioBuffer: () => path.join(app.getPath('userData'), 'system-audio-buffer'),
+  work: () => path.join(app.getPath('userData'), 'work'),
+  nativeCaptureHelper: () => {
+    const userTool = path.join(app.getPath('userData'), 'tools', 'native-capture', 'PapatyaNativeCapture.exe');
+    if (fsSync.existsSync(userTool)) return userTool;
+    const bundled = path.join(__dirname, '..', 'assets', 'native-capture', 'PapatyaNativeCapture.exe');
+    return resolveExecutablePath(bundled);
+  },
   systemAudioHelper: () => {
     const userTool = path.join(app.getPath('userData'), 'tools', 'audio-loopback', 'PapatyaAudioLoopback.exe');
     if (fsSync.existsSync(userTool)) return userTool;
@@ -120,6 +153,380 @@ function logLine(scope, message, extra = null) {
   fs.appendFile(paths.log(), line).catch(() => {});
 }
 
+function sendGpuStatus(payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('gpu-status', payload);
+  }
+}
+
+function parseBitrateKbps(bitrate) {
+  const value = String(bitrate || '').trim().toLowerCase();
+  if (value.endsWith('k')) return Math.max(1, Number.parseInt(value, 10) || 1);
+  if (value.endsWith('m')) return Math.max(1, (Number.parseFloat(value) || 1) * 1000);
+  return Math.max(1, Math.round((Number.parseInt(value, 10) || 1000) / 1000));
+}
+
+function nativeCapturePayload(extra = {}) {
+  const qualityKey = String(settings.quality || '720').toLowerCase();
+  const quality = QUALITY[qualityKey] || QUALITY[720];
+  return {
+    quality: qualityKey === '2k' ? '2k' : `${qualityKey}p`,
+    fps: normalizedFps(settings.fps),
+    clipSeconds: Math.max(1, Number(settings.clipSeconds) || 30),
+    bitrateKbps: parseBitrateKbps(quality.bitrate),
+    includeSystemAudio: Boolean(settings.includeAudio),
+    includeMic: Boolean(settings.includeMic),
+    micDeviceId: settings.micDeviceId || 'default',
+    outputDir: paths.clips(),
+    tempDir: paths.work(),
+    drawCursor: false,
+    ...extra
+  };
+}
+
+function rejectNativePending(error) {
+  for (const { reject, timer } of nativeCaptureState.pending.values()) {
+    clearTimeout(timer);
+    reject(error);
+  }
+  nativeCaptureState.pending.clear();
+}
+
+function handleNativeCaptureEvent(event) {
+  if (!event || typeof event !== 'object') return;
+  logLine('native', 'event', event);
+
+  if (event.id && nativeCaptureState.pending.has(event.id)) {
+    const pending = nativeCaptureState.pending.get(event.id);
+    nativeCaptureState.pending.delete(event.id);
+    clearTimeout(pending.timer);
+    if (event.type === 'error') {
+      const error = new Error(event.message || event.code || 'Native capture failed');
+      error.code = event.code || 'NATIVE_ERROR';
+      pending.reject(error);
+    } else {
+      pending.resolve(event);
+    }
+    return;
+  }
+
+  if (event.type === 'ready') {
+    nativeCaptureState.ready = true;
+    nativeCaptureState.lastError = null;
+    return;
+  }
+
+  if (event.type === 'recording') {
+    sendGpuStatus({
+      ok: true,
+      mode: 'native',
+      message: `Native Recording ${Math.round(Number(event.bufferedSeconds) || 0)}s buffered`
+    });
+    return;
+  }
+
+  if (event.type === 'error') {
+    nativeCaptureState.lastError = event;
+    sendGpuStatus({ ok: false, mode: 'native', message: event.message || event.code || 'Native capture error' });
+  }
+}
+
+function handleNativeCaptureStdout(data) {
+  nativeCaptureState.lineBuffer += data.toString();
+  const lines = nativeCaptureState.lineBuffer.split(/\r?\n/);
+  nativeCaptureState.lineBuffer = lines.pop() || '';
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      handleNativeCaptureEvent(JSON.parse(line));
+    } catch (error) {
+      logLine('native', 'bad-json', { line: line.slice(0, 500), message: error.message });
+    }
+  }
+}
+
+function ensureNativeCaptureProcess() {
+  if (nativeCaptureState.process && !nativeCaptureState.process.killed) return Promise.resolve(true);
+
+  const helperPath = paths.nativeCaptureHelper();
+  if (!fsSync.existsSync(helperPath)) {
+    const error = new Error(`Native capture helper missing: ${helperPath}`);
+    error.code = 'NATIVE_HELPER_MISSING';
+    return Promise.reject(error);
+  }
+
+  nativeCaptureState.ready = false;
+  nativeCaptureState.lineBuffer = '';
+  const child = spawn(helperPath, [], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  nativeCaptureState.process = child;
+  let stderr = '';
+
+  child.stdout.on('data', handleNativeCaptureStdout);
+  child.stderr.on('data', (data) => {
+    stderr += data.toString();
+    if (stderr.length > 6000) stderr = stderr.slice(-3000);
+  });
+  child.on('error', (error) => {
+    logLine('native', 'spawn-error', { message: error.message, helperPath });
+    rejectNativePending(error);
+  });
+  child.on('close', (code) => {
+    logLine('native', 'close', { code, stderr: stderr.trim().slice(-800) });
+    if (nativeCaptureState.process === child) nativeCaptureState.process = null;
+    nativeCaptureState.ready = false;
+    nativeCaptureState.running = false;
+    rejectNativePending(new Error(stderr.trim() || `Native capture exited with code ${code}`));
+  });
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Native capture helper did not become ready')), 2500);
+    const check = () => {
+      if (nativeCaptureState.ready) {
+        clearTimeout(timer);
+        resolve(true);
+        return;
+      }
+      if (!nativeCaptureState.process || nativeCaptureState.process.killed) {
+        clearTimeout(timer);
+        reject(new Error('Native capture helper exited before ready'));
+        return;
+      }
+      setTimeout(check, 50);
+    };
+    check();
+  });
+}
+
+async function sendNativeCaptureCommand(payload, timeoutMs = 5000) {
+  await ensureNativeCaptureProcess();
+  const child = nativeCaptureState.process;
+  if (!child || !child.stdin || child.stdin.destroyed) throw new Error('Native capture stdin unavailable');
+
+  const id = String(nativeCaptureState.nextId++);
+  const message = { id, ...payload };
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nativeCaptureState.pending.delete(id);
+      reject(new Error(`Native capture command timed out: ${payload.type}`));
+    }, timeoutMs);
+    nativeCaptureState.pending.set(id, { resolve, reject, timer });
+    child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+      if (!error) return;
+      clearTimeout(timer);
+      nativeCaptureState.pending.delete(id);
+      reject(error);
+    });
+  });
+}
+
+async function startNativeCapture() {
+  const event = await sendNativeCaptureCommand({ type: 'start', ...nativeCapturePayload() }, 6000);
+  nativeCaptureState.running = true;
+  sendGpuStatus({ ok: true, mode: 'native', message: 'Native capture aktif.' });
+  return { ok: true, mode: 'native', engine: event.engine || 'native-nvenc' };
+}
+
+async function stopNativeCapture() {
+  const child = nativeCaptureState.process;
+  nativeCaptureState.running = false;
+  if (!child || child.killed) return true;
+  try {
+    await sendNativeCaptureCommand({ type: 'stop' }, 2500).catch(() => null);
+    child.stdin.write(`${JSON.stringify({ type: 'shutdown' })}\n`);
+    child.stdin.end();
+  } catch {
+    try {
+      child.kill('SIGTERM');
+    } catch {}
+  }
+  return true;
+}
+
+async function saveNativeClip(payload) {
+  await fs.mkdir(paths.clips(), { recursive: true });
+  const title = sanitizeFilePart(payload.title || `${APP_NAME}-${new Date().toISOString().replace(/[:.]/g, '-')}`);
+  const event = await sendNativeCaptureCommand({
+    type: 'save',
+    title,
+    requestedAt: Number(payload.requestedAt) || Date.now()
+  }, 20000);
+  const nativeVideoPath = event.videoPath || event.filePath;
+  if (!nativeVideoPath) throw new Error('Native video output missing');
+
+  const requestedAt = Number(payload.requestedAt) || Date.now();
+  const requestedClipSeconds = Math.max(1, Number(settings.clipSeconds) || 30);
+  const nativeStartedAt = Number(event.startedAt) || (requestedAt - requestedClipSeconds * 1000);
+  const nativeEndedAt = Number(event.endedAt) || requestedAt;
+  const availableAt = Math.min(requestedAt, nativeEndedAt);
+  const clipStartMs = nativeStartedAt;
+  const clipDurationSeconds = Math.max(
+    0.1,
+    Math.min(requestedClipSeconds + 2.5, (availableAt - clipStartMs) / 1000)
+  );
+  const videoTrimStartSeconds = 0;
+  const outputFps = Math.min(normalizedFps(settings.fps), Number(event.fps) || normalizedFps(settings.fps));
+  const nativeVideoInputArgs = ['-fflags', '+genpts', '-f', 'h264', '-r', String(outputFps), '-i', nativeVideoPath];
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const filePath = path.join(paths.clips(), `${title}.mp4`);
+  const safeSegmentCutoff = Date.now() - FINALIZED_SEGMENT_AGE_MS;
+  const nativeSystemAudioPath = event.systemAudioPath && fsSync.existsSync(event.systemAudioPath)
+    ? event.systemAudioPath
+    : null;
+  const nativeMicAudioPath = event.micAudioPath && fsSync.existsSync(event.micAudioPath)
+    ? event.micAudioPath
+    : null;
+
+  if (!nativeSystemAudioPath && !nativeMicAudioPath) await scanSystemAudioSegments();
+
+  const systemAudioEntries = nativeSystemAudioPath
+    ? [{
+        path: nativeSystemAudioPath,
+        at: availableAt,
+        startedAt: Number(event.systemAudioStartedAt) || clipStartMs,
+        endedAt: availableAt
+      }]
+    : systemAudioState.segments
+        .filter((segment) => segment.endedAt <= safeSegmentCutoff && segment.endedAt >= clipStartMs && streamStartMs(segment) <= availableAt)
+        .sort((a, b) => a.at - b.at)
+        .filter((segment) => fsSync.existsSync(segment.path));
+  const systemAudioChunks = systemAudioEntries.map((segment) => segment.path);
+
+  const micAudioEntries = nativeMicAudioPath
+    ? [{
+        path: nativeMicAudioPath,
+        at: availableAt,
+        startedAt: Number(event.micAudioStartedAt) || clipStartMs,
+        endedAt: availableAt
+      }]
+    : bufferState.chunks
+        .filter((chunk) => chunk.endedAt >= clipStartMs && streamStartMs(chunk) <= availableAt)
+        .sort((a, b) => a.at - b.at)
+        .filter((chunk) => fsSync.existsSync(bufferFilePath(chunk.id)));
+  const micAudioChunks = nativeMicAudioPath
+    ? [nativeMicAudioPath]
+    : micAudioEntries.map((chunk) => bufferFilePath(chunk.id));
+  const audioChunks = [...systemAudioChunks, ...micAudioChunks];
+
+  try {
+    if (!systemAudioChunks.length && !micAudioChunks.length) {
+      await runFfmpeg([
+        '-y',
+        ...nativeVideoInputArgs,
+        '-map', '0:v:0',
+        '-c:v', 'copy',
+        '-video_track_timescale', '90000',
+        '-an',
+        '-movflags', '+faststart',
+        '-t', formatSeconds(clipDurationSeconds),
+        filePath
+      ]);
+    } else {
+      const tempSystemAudioPath = nativeSystemAudioPath || (systemAudioChunks.length
+        ? path.join(paths.work(), `native-system-${stamp}.wav`)
+        : null);
+      const tempMicAudioPath = nativeMicAudioPath || (micAudioChunks.length
+        ? path.join(paths.work(), `native-mic-${stamp}.wav`)
+        : null);
+      if (tempSystemAudioPath && !nativeSystemAudioPath) await concatAudioFilesToWav(systemAudioChunks, tempSystemAudioPath);
+      if (tempMicAudioPath && !nativeMicAudioPath) await concatAudioFilesToWav(micAudioChunks, tempMicAudioPath);
+      try {
+        const audioBalance = await buildBalancedAudioFilters(tempSystemAudioPath, tempMicAudioPath);
+        const muxArgs = ['-y', ...nativeVideoInputArgs];
+        const filterInputs = [];
+        let audioInputIndex = 1;
+        let systemOffset = null;
+        let micOffset = null;
+        let micAdjustedOffset = null;
+        if (tempSystemAudioPath) {
+          systemOffset = syncOffsetSeconds(
+            nativeSystemAudioPath ? Number(event.systemAudioStartedAt) || clipStartMs : streamStartMs(systemAudioEntries[0]),
+            clipStartMs
+          );
+          muxArgs.push('-i', tempSystemAudioPath);
+          filterInputs.push(audioInputChain(audioInputIndex, audioBalance.system, systemOffset, 'sys'));
+          audioInputIndex += 1;
+        }
+        if (tempMicAudioPath) {
+          micOffset = syncOffsetSeconds(
+            nativeMicAudioPath ? Number(event.micAudioStartedAt) || clipStartMs : streamStartMs(micAudioEntries[0]),
+            clipStartMs
+          );
+          const micSyncAdvance = nativeMicAudioPath ? 0 : MIC_SYNC_ADVANCE_SECONDS;
+          micAdjustedOffset = micOffset - micSyncAdvance;
+          muxArgs.push('-i', tempMicAudioPath);
+          filterInputs.push(audioInputChain(audioInputIndex, audioBalance.mic, micAdjustedOffset, 'mic'));
+        }
+
+        logLine('native', 'audio-sync', {
+          systemOffset,
+          micOffset,
+          micSyncAdvance: nativeMicAudioPath ? 0 : MIC_SYNC_ADVANCE_SECONDS,
+          micAdjustedOffset,
+          clipDurationSeconds,
+          videoTrimStartSeconds,
+          videoCopyMux: true
+        });
+
+        if (tempSystemAudioPath && tempMicAudioPath) {
+          muxArgs.push(
+            '-filter_complex',
+            [...filterInputs, `[sys][mic]amix=inputs=2:duration=longest:normalize=0,${finalClipAudioFilter(clipDurationSeconds)}[aout]`].join(';')
+          );
+        } else if (tempSystemAudioPath) {
+          muxArgs.push('-filter_complex', [...filterInputs, `[sys]${finalClipAudioFilter(clipDurationSeconds)}[aout]`].join(';'));
+        } else {
+          muxArgs.push('-filter_complex', [...filterInputs, `[mic]${finalClipAudioFilter(clipDurationSeconds)}[aout]`].join(';'));
+        }
+
+        muxArgs.push(
+          '-map', '0:v:0',
+          '-map', '[aout]',
+          '-c:v', 'copy',
+          '-video_track_timescale', '90000',
+          '-c:a', 'aac',
+          '-b:a', '320k',
+          '-ar', '48000',
+          '-ac', '2',
+          '-avoid_negative_ts', 'make_zero',
+          '-movflags', '+faststart',
+          '-t', formatSeconds(clipDurationSeconds),
+          filePath
+        );
+        await runFfmpeg(muxArgs);
+      } finally {
+        if (tempSystemAudioPath && !nativeSystemAudioPath) await fs.rm(tempSystemAudioPath, { force: true }).catch(() => {});
+        if (tempMicAudioPath && !nativeMicAudioPath) await fs.rm(tempMicAudioPath, { force: true }).catch(() => {});
+      }
+    }
+  } finally {
+    await fs.rm(nativeVideoPath, { force: true }).catch(() => {});
+    if (nativeSystemAudioPath) await fs.rm(nativeSystemAudioPath, { force: true }).catch(() => {});
+    if (nativeMicAudioPath) await fs.rm(nativeMicAudioPath, { force: true }).catch(() => {});
+  }
+
+  logLine('native', 'saved', {
+    filePath,
+    nativeVideoPath,
+    audioSegments: audioChunks.length,
+    systemAudioSegments: systemAudioChunks.length,
+    micAudioSegments: micAudioChunks.length,
+    clipDurationSeconds,
+    nativeStartedAt,
+    nativeEndedAt,
+    videoCopyMux: true,
+    requestedAt,
+    availableAt
+  });
+
+  return {
+    filePath,
+    clips: await listClips(),
+    audioSegments: audioChunks.length,
+    systemAudioSegments: systemAudioChunks.length,
+    micAudioSegments: micAudioChunks.length
+  };
+}
+
 async function ensureDirs() {
   await fs.mkdir(paths.userData(), { recursive: true });
   await fs.mkdir(paths.clips(), { recursive: true });
@@ -127,6 +534,8 @@ async function ensureDirs() {
   await fs.mkdir(paths.buffer(), { recursive: true });
   await fs.mkdir(paths.gpuBuffer(), { recursive: true });
   await fs.mkdir(paths.systemAudioBuffer(), { recursive: true });
+  await fs.rm(paths.work(), { recursive: true, force: true }).catch(() => {});
+  await fs.mkdir(paths.work(), { recursive: true });
   await fs.writeFile(paths.log(), '', { flag: 'a' });
   logLine('app', 'directories-ready', { userData: paths.userData(), clips: paths.clips() });
   await migrateLegacyClips();
@@ -166,6 +575,8 @@ async function saveSettings(next) {
     quality: settings.quality,
     fps: settings.fps,
     encoderMode: settings.encoderMode,
+    captureTargetMode: settings.captureTargetMode,
+    gameProcessName: settings.gameProcessName,
     includeAudio: settings.includeAudio,
     includeMic: settings.includeMic
   });
@@ -177,6 +588,12 @@ function normalizeSettings(next) {
   const normalizedHotkey = normalizeHotkey(next.hotkey);
   const normalizedScreenshotHotkey = normalizeHotkey(next.screenshotHotkey || DEFAULT_SETTINGS.screenshotHotkey);
   const normalizedCaptureBackend = 'dda';
+  let captureTargetMode = CAPTURE_TARGET_MODES.has(String(next.captureTargetMode || '').toLowerCase())
+    ? String(next.captureTargetMode).toLowerCase()
+    : DEFAULT_SETTINGS.captureTargetMode;
+  if (captureTargetMode === 'desktop' && next.desktopCaptureConfirmed !== true) {
+    captureTargetMode = DEFAULT_SETTINGS.captureTargetMode;
+  }
   const notificationSounds = Array.isArray(next.notificationSounds)
     ? next.notificationSounds
         .filter((sound) => sound && sound.id && sound.path)
@@ -197,6 +614,10 @@ function normalizeSettings(next) {
     hotkey: normalizedHotkey,
     screenshotHotkey: normalizedScreenshotHotkey,
     captureBackend: normalizedCaptureBackend,
+    captureTargetMode,
+    desktopCaptureConfirmed: captureTargetMode === 'desktop' && next.desktopCaptureConfirmed === true,
+    gameProcessName: String(next.gameProcessName || '').trim(),
+    gameProcessTitle: String(next.gameProcessTitle || '').trim(),
     notificationSoundId,
     notificationSounds
   };
@@ -651,7 +1072,7 @@ function formatSeconds(value) {
   return String(Math.max(0, Number(value) || 0).toFixed(3)).replace(/\.?0+$/, '');
 }
 
-function cfrVideoEncodeArgs({ fps, quality, audio = false, trimStart = 0, duration = null }) {
+function cfrVideoEncodeArgs({ fps, quality, audio = false, trimStart = 0, duration = null, encoder = 'nvenc' }) {
   const videoFilters = [];
   const trimParts = [];
   if (Number(trimStart) > 0.001) trimParts.push(`start=${formatSeconds(trimStart)}`);
@@ -660,21 +1081,32 @@ function cfrVideoEncodeArgs({ fps, quality, audio = false, trimStart = 0, durati
   videoFilters.push(`fps=${fps}:round=near`);
   videoFilters.push('setpts=PTS-STARTPTS');
 
+  const encodeArgs = encoder === 'cpu'
+    ? [
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '20',
+        '-pix_fmt', 'yuv420p'
+      ]
+    : [
+        '-c:v', 'h264_nvenc',
+        '-preset', 'p3',
+        '-tune', 'hq',
+        '-rc', 'vbr',
+        '-cq', '21',
+        '-b:v', quality.bitrate,
+        '-maxrate', quality.bitrate,
+        '-bufsize', quality.bitrate,
+        '-g', String(fps * 2),
+        '-bf', '0',
+        '-rc-lookahead', '0'
+      ];
+
   return [
     '-vf', videoFilters.join(','),
     '-fps_mode', 'cfr',
     '-r', String(fps),
-    '-c:v', 'h264_nvenc',
-    '-preset', 'p3',
-    '-tune', 'hq',
-    '-rc', 'vbr',
-    '-cq', '21',
-    '-b:v', quality.bitrate,
-    '-maxrate', quality.bitrate,
-    '-bufsize', quality.bitrate,
-    '-g', String(fps * 2),
-    '-bf', '0',
-    '-rc-lookahead', '0',
+    ...encodeArgs,
     '-video_track_timescale', '90000',
     ...(audio ? [] : ['-an'])
   ];
@@ -725,7 +1157,7 @@ async function scanGpuSegments() {
         const filePath = path.join(paths.gpuBuffer(), entry.name);
         const stat = await fs.stat(filePath).catch(() => null);
         if (!stat) return;
-        if (stat.mtimeMs < cutoff) {
+        if (stat.mtimeMs < cutoff && clipSavesInFlight === 0) {
           await fs.rm(filePath, { force: true }).catch(() => {});
           return;
         }
@@ -759,7 +1191,7 @@ async function scanSystemAudioSegments() {
         const filePath = path.join(paths.systemAudioBuffer(), entry.name);
         const stat = await fs.stat(filePath).catch(() => null);
         if (!stat) return;
-        if (stat.mtimeMs < cutoff) {
+        if (stat.mtimeMs < cutoff && clipSavesInFlight === 0) {
           await fs.rm(filePath, { force: true }).catch(() => {});
           return;
         }
@@ -860,7 +1292,202 @@ async function startSystemAudioCapture(nextSettings = {}) {
   return { ok: true };
 }
 
-function stopGpuCapture() {
+function normalizeProcessName(value) {
+  return String(value || '').trim().toLowerCase().replace(/\.exe$/i, '');
+}
+
+function selectedGameName() {
+  return normalizeProcessName(settings.gameProcessName);
+}
+
+function selectedGameLabel() {
+  return settings.gameProcessTitle || settings.gameProcessName || 'oyun';
+}
+
+function shouldWaitForGameTarget() {
+  const mode = settings.captureTargetMode || DEFAULT_SETTINGS.captureTargetMode;
+  if (mode === 'desktop') return false;
+  return true;
+}
+
+function stopCaptureGate() {
+  captureGateState.desired = false;
+  captureGateState.active = false;
+  captureGateState.starting = false;
+  captureGateState.forcedBackend = null;
+  captureGateState.lastMatchedName = '';
+  captureGateState.lastStatus = '';
+  if (captureGateState.timer) {
+    clearInterval(captureGateState.timer);
+    captureGateState.timer = null;
+  }
+}
+
+function sendGateStatus(message, extra = {}) {
+  if (captureGateState.lastStatus === message) return;
+  captureGateState.lastStatus = message;
+  sendGpuStatus({ ok: true, mode: 'waiting', message, ...extra });
+}
+
+async function findSelectedGameProcess() {
+  const targetName = selectedGameName();
+  const foreground = await getForegroundApp();
+  if (!foreground) return null;
+  if (targetName) {
+    return normalizeProcessName(foreground.name) === targetName ? foreground : null;
+  }
+  return detectLikelyGameProcess([foreground]);
+}
+
+function detectLikelyGameProcess(apps) {
+  const blockedNames = new Set([
+    'applicationframehost',
+    'chrome',
+    'code',
+    'codium',
+    'explorer',
+    'firefox',
+    'msedge',
+    'nvidia overlay',
+    'obs64',
+    'papatya',
+    'powershell',
+    'systemsettings',
+    'taskmgr',
+    'textinputhost',
+    'windowsterminal',
+    'womicclient'
+  ]);
+  const candidates = (apps || [])
+    .filter((app) => app && app.name)
+    .filter((app) => !blockedNames.has(normalizeProcessName(app.name)))
+    .map((app) => {
+      const name = normalizeProcessName(app.name);
+      const title = String(app.title || '').toLowerCase();
+      let score = 0;
+      if (/^(crosvm|googleplaygames|googleplaygamesservices|googleplaygamesbootstrapper)$/i.test(name)) score += 70;
+      if (/google\s*play\s*games|googleplaygames|android.*game|play\s*games/i.test(`${name} ${title}`)) score += 60;
+      if (/game|oyun|valorant|fortnite|roblox|minecraft|geometry|cs2|counter|league|riot|steamapps|unreal|unity|dash|dashlite/i.test(`${name} ${title}`)) score += 40;
+      if (/settings|ayarlar|update|launcher|client|overlay|helper|service/i.test(`${name} ${title}`)) score -= 25;
+      return { app, score };
+    })
+    .filter((entry) => entry.score >= 35)
+    .sort((a, b) => b.score - a.score);
+  return candidates[0]?.app || null;
+}
+
+function getForegroundApp() {
+  return new Promise((resolve) => {
+    const script = [
+      '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;',
+      'Add-Type @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'public class Win32Foreground {',
+      '  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+      '  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);',
+      '}',
+      '"@;',
+      '$hwnd=[Win32Foreground]::GetForegroundWindow();',
+      '$pidValue=0;',
+      '[void][Win32Foreground]::GetWindowThreadProcessId($hwnd,[ref]$pidValue);',
+      '$p=Get-Process -Id $pidValue -ErrorAction SilentlyContinue;',
+      'if ($p) {',
+      '  [pscustomobject]@{processId=[string]$p.Id;name=$p.ProcessName;title=$p.MainWindowTitle} | ConvertTo-Json -Compress',
+      '}'
+    ].join(' ');
+    const child = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script], {
+      windowsHide: true
+    });
+    let stdout = '';
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+    child.on('error', () => resolve(null));
+    child.on('close', () => {
+      try {
+        const row = JSON.parse(stdout || 'null');
+        if (!row || !row.processId || !row.name || row.title === APP_NAME) return resolve(null);
+        resolve({
+          processId: String(row.processId),
+          name: String(row.name || 'App'),
+          title: String(row.title || row.name || 'App')
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+async function pollCaptureGate() {
+  if (!captureGateState.desired || captureGateState.starting) return;
+  const targetName = selectedGameName();
+  const matched = await findSelectedGameProcess().catch(() => null);
+  if (!matched) {
+    if (captureGateState.active) {
+      logLine('gate', 'game-closed', { targetName });
+      await stopGpuCapture({ keepGate: true }).catch(() => {});
+      captureGateState.active = false;
+      captureGateState.lastMatchedName = '';
+    }
+    sendGateStatus(targetName ? `${selectedGameLabel()} bekleniyor.` : 'Oyun/uygulama bekleniyor.');
+    return;
+  }
+
+  if (captureGateState.active && captureGateState.lastMatchedName === matched.name) return;
+  if (captureGateState.active) {
+    await stopGpuCapture({ keepGate: true }).catch(() => {});
+    captureGateState.active = false;
+    captureGateState.lastMatchedName = '';
+  }
+  captureGateState.starting = true;
+  try {
+    logLine('gate', 'game-found', { targetName, matched });
+    sendGateStatus(`${matched.name} acildi, kayit baslatiliyor.`);
+    await startGpuCaptureEngine({}, captureGateState.forcedBackend);
+    captureGateState.active = true;
+    captureGateState.lastMatchedName = matched.name;
+    captureGateState.lastStatus = '';
+    sendGpuStatus({ ok: true, mode: 'native', message: `${matched.name} icin kayit aktif.` });
+  } catch (error) {
+    captureGateState.active = false;
+    logLine('gate', 'start-failed', { targetName, message: error.message });
+    sendGpuStatus({ ok: false, mode: 'waiting', message: error.message });
+  } finally {
+    captureGateState.starting = false;
+  }
+}
+
+async function startCaptureGate(forcedBackend = null) {
+  captureGateState.desired = true;
+  captureGateState.active = false;
+  captureGateState.starting = false;
+  captureGateState.forcedBackend = forcedBackend;
+  captureGateState.lastMatchedName = '';
+  captureGateState.lastStatus = '';
+  if (captureGateState.timer) clearInterval(captureGateState.timer);
+  captureGateState.timer = setInterval(() => pollCaptureGate().catch((error) => {
+    logLine('gate', 'poll-error', { message: error.message });
+  }), GAME_POLL_MS);
+  await pollCaptureGate();
+  return {
+    ok: true,
+    mode: 'waiting',
+    target: settings.gameProcessName || '',
+    message: selectedGameName()
+      ? `${selectedGameLabel()} bekleniyor.`
+      : 'Oyun/uygulama bekleniyor.'
+  };
+}
+
+async function stopGpuCapture(options = {}) {
+  const keepGate = Boolean(options.keepGate);
+  if (!keepGate) stopCaptureGate();
+  await stopNativeCapture().catch((error) => {
+    logLine('native', 'stop-error', { message: error.message });
+  });
+
   if (gpuState.scanner) {
     clearInterval(gpuState.scanner);
     gpuState.scanner = null;
@@ -898,8 +1525,8 @@ function stopGpuCapture() {
   });
 }
 
-async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
-  await stopGpuCapture();
+async function startFfmpegGpuCapture(nextSettings = {}, forcedBackend = null, options = {}) {
+  if (!options.skipStop) await stopGpuCapture();
   settings = { ...settings, ...nextSettings };
   await resetGpuBuffer();
   await startSystemAudioCapture(settings);
@@ -955,6 +1582,44 @@ async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
     }
   }, GPU_SEGMENT_MS + 3500);
   return { ok: true, mode: 'gpu', backend };
+}
+
+async function startGpuCaptureEngine(nextSettings = {}, forcedBackend = null) {
+  settings = { ...settings, ...nextSettings };
+
+  if (!forcedBackend && (settings.captureBackend || 'dda') === 'dda') {
+    try {
+      const result = await startNativeCapture();
+      logLine('native', 'start-ok', result);
+      return result;
+    } catch (error) {
+      nativeCaptureState.running = false;
+      logLine('native', 'fallback-ffmpeg', { code: error.code, message: error.message });
+      sendGpuStatus({
+        ok: true,
+        mode: 'gpu',
+        message: `${error.message} FFmpeg fallback baslatiliyor.`
+      });
+    }
+  }
+
+  return startFfmpegGpuCapture({}, forcedBackend, { skipStop: true });
+}
+
+async function startGpuCapture(nextSettings = {}, forcedBackend = null) {
+  await stopGpuCapture();
+  settings = { ...settings, ...nextSettings };
+
+  if (shouldWaitForGameTarget()) {
+    logLine('gate', 'start-waiting', {
+      mode: settings.captureTargetMode,
+      gameProcessName: settings.gameProcessName,
+      gameProcessTitle: settings.gameProcessTitle
+    });
+    return startCaptureGate(forcedBackend);
+  }
+
+  return startGpuCaptureEngine({}, forcedBackend);
 }
 
 async function trimBuffer() {
@@ -1180,15 +1845,20 @@ async function saveBufferClip(payload) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const title = sanitizeFilePart(payload.title || `${APP_NAME}-${stamp}`);
   const filePath = path.join(paths.clips(), `${title}.webm`);
-  const listPath = path.join(paths.buffer(), `${bufferState.sessionId}-concat.txt`);
-  await fs.writeFile(listPath, segmentPaths.map(concatListLine).join('\n'));
-  await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', filePath]);
-  logLine('clip', 'buffer-saved', { filePath, segments: segmentPaths.length });
+  const listPath = path.join(paths.work(), `${bufferState.sessionId}-buffer-concat.txt`);
+  try {
+    await fs.writeFile(listPath, segmentPaths.map(concatListLine).join('\n'));
+    await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', filePath]);
+    logLine('clip', 'buffer-saved', { filePath, segments: segmentPaths.length });
+  } finally {
+    await fs.rm(listPath, { force: true }).catch(() => {});
+  }
   return { filePath, clips: await listClips() };
 }
 
 async function concatFiles(inputPaths, outputPath) {
-  const listPath = path.join(paths.buffer(), `${Date.now()}-concat.txt`);
+  await fs.mkdir(paths.work(), { recursive: true });
+  const listPath = path.join(paths.work(), `${Date.now()}-${Math.random().toString(16).slice(2)}-concat.txt`);
   await fs.writeFile(listPath, inputPaths.map(concatListLine).join('\n'));
   try {
     await runFfmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', outputPath]);
@@ -1227,16 +1897,63 @@ function finalClipAudioFilter(durationSeconds) {
   return `apad=whole_dur=${duration},atrim=duration=${duration},${CLIP_AUDIO_FILTER}`;
 }
 
+async function concatAudioFilesToWav(inputPaths, outputPath) {
+  const listPath = path.join(paths.work(), `${Date.now()}-${Math.random().toString(16).slice(2)}-audio-concat.txt`);
+  await fs.writeFile(listPath, inputPaths.map(concatListLine).join('\n'));
+  try {
+    await runFfmpeg([
+      '-y',
+      '-fflags', '+genpts',
+      '-f', 'concat',
+      '-safe', '0',
+      '-i', listPath,
+      '-vn',
+      '-af', 'aresample=async=1000:first_pts=0',
+      '-c:a', 'pcm_f32le',
+      '-ar', '48000',
+      '-ac', '2',
+      outputPath
+    ]);
+  } finally {
+    await fs.rm(listPath, { force: true }).catch(() => {});
+  }
+}
+
 async function saveGpuClip(payload) {
-  await stopGpuCapture();
+  if (nativeCaptureState.running) {
+    return saveNativeClip(payload);
+  }
+  if (captureGateState.desired && !captureGateState.active) {
+    throw new Error(selectedGameName()
+      ? `${selectedGameLabel()} acilinca klip buffer'i baslayacak.`
+      : 'Oyun/uygulama acilinca klip bufferi baslayacak.');
+  }
+
+  clipSavesInFlight += 1;
+  try {
+    return await saveGpuClipUnsafe(payload);
+  } finally {
+    clipSavesInFlight = Math.max(0, clipSavesInFlight - 1);
+  }
+}
+
+async function saveGpuClipUnsafe(payload) {
   await scanGpuSegments();
   await scanSystemAudioSegments();
   await fs.mkdir(paths.clips(), { recursive: true });
   const requestedAt = Number(payload.requestedAt) || Date.now();
   const requestedClipSeconds = Math.max(1, Number(settings.clipSeconds) || 30);
-  const cutoff = requestedAt - requestedClipSeconds * 1000;
-  const videoSegments = gpuState.segments
-    .filter((segment) => segment.endedAt >= cutoff && streamStartMs(segment) <= requestedAt)
+  const safeSegmentCutoff = Date.now() - FINALIZED_SEGMENT_AGE_MS;
+  let videoSegments = gpuState.segments
+    .filter((segment) => segment.endedAt <= safeSegmentCutoff && streamStartMs(segment) <= requestedAt)
+    .sort((a, b) => a.at - b.at);
+
+  if (!videoSegments.length) throw new Error('GPU buffer is empty');
+
+  const availableAt = Math.min(requestedAt, videoSegments[videoSegments.length - 1].endedAt);
+  const cutoff = availableAt - requestedClipSeconds * 1000;
+  videoSegments = videoSegments
+    .filter((segment) => segment.endedAt >= cutoff && streamStartMs(segment) <= availableAt)
     .sort((a, b) => a.at - b.at);
 
   if (!videoSegments.length) throw new Error('GPU buffer is empty');
@@ -1244,23 +1961,24 @@ async function saveGpuClip(payload) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const title = sanitizeFilePart(payload.title || `${APP_NAME}-${stamp}`);
   const filePath = path.join(paths.clips(), `${title}.mp4`);
-  const tempVideoPath = path.join(paths.gpuBuffer(), `${gpuState.sessionId}-video-${stamp}.mp4`);
+  await fs.mkdir(paths.work(), { recursive: true });
+  const tempVideoPath = path.join(paths.work(), `video-${stamp}.mp4`);
   const outputFps = Math.min(normalizedFps(settings.fps), gpuState.captureFps || normalizedFps(settings.fps));
   const outputQuality = QUALITY[String(settings.quality || '720').toLowerCase()] || QUALITY[720];
   await concatFiles(videoSegments.map((segment) => segment.path), tempVideoPath);
   const firstVideoStartMs = streamStartMs(videoSegments[0]);
   const clipStartMs = Math.max(cutoff, firstVideoStartMs);
-  const clipDurationSeconds = Math.max(0.1, Math.min(requestedClipSeconds, (requestedAt - clipStartMs) / 1000));
+  const clipDurationSeconds = Math.max(0.1, Math.min(requestedClipSeconds, (availableAt - clipStartMs) / 1000));
   const videoTrimStartSeconds = Math.max(0, (clipStartMs - firstVideoStartMs) / 1000);
 
   const systemAudioEntries = systemAudioState.segments
-    .filter((segment) => segment.endedAt >= cutoff && streamStartMs(segment) <= requestedAt)
+    .filter((segment) => segment.endedAt <= safeSegmentCutoff && segment.endedAt >= cutoff && streamStartMs(segment) <= availableAt)
     .sort((a, b) => a.at - b.at)
     .filter((segment) => fsSync.existsSync(segment.path));
   const systemAudioChunks = systemAudioEntries.map((segment) => segment.path);
 
   const micAudioEntries = bufferState.chunks
-    .filter((chunk) => chunk.endedAt >= cutoff && streamStartMs(chunk) <= requestedAt)
+    .filter((chunk) => chunk.endedAt >= cutoff && streamStartMs(chunk) <= availableAt)
     .sort((a, b) => a.at - b.at)
     .filter((chunk) => fsSync.existsSync(bufferFilePath(chunk.id)));
   const micAudioChunks = micAudioEntries.map((chunk) => bufferFilePath(chunk.id));
@@ -1277,20 +1995,21 @@ async function saveGpuClip(payload) {
         quality: outputQuality,
         audio: false,
         trimStart: videoTrimStartSeconds,
-        duration: clipDurationSeconds
+        duration: clipDurationSeconds,
+        encoder: 'cpu'
       }),
       '-movflags', '+faststart',
       filePath
     ]);
   } else {
     const tempSystemAudioPath = systemAudioChunks.length
-      ? path.join(paths.systemAudioBuffer(), `${systemAudioState.sessionId}-system-${stamp}.wav`)
+      ? path.join(paths.work(), `system-${stamp}.wav`)
       : null;
     const tempMicAudioPath = micAudioChunks.length
-      ? path.join(paths.buffer(), `${bufferState.sessionId}-mic-${stamp}.webm`)
+      ? path.join(paths.work(), `mic-${stamp}.wav`)
       : null;
-    if (tempSystemAudioPath) await concatFiles(systemAudioChunks, tempSystemAudioPath);
-    if (tempMicAudioPath) await concatFiles(micAudioChunks, tempMicAudioPath);
+    if (tempSystemAudioPath) await concatAudioFilesToWav(systemAudioChunks, tempSystemAudioPath);
+    if (tempMicAudioPath) await concatAudioFilesToWav(micAudioChunks, tempMicAudioPath);
     try {
       const audioBalance = await buildBalancedAudioFilters(tempSystemAudioPath, tempMicAudioPath);
       const muxArgs = ['-y', '-fflags', '+genpts'];
@@ -1344,7 +2063,8 @@ async function saveGpuClip(payload) {
           quality: outputQuality,
           audio: true,
           trimStart: videoTrimStartSeconds,
-          duration: clipDurationSeconds
+          duration: clipDurationSeconds,
+          encoder: 'cpu'
         }),
         '-c:a', 'aac',
         '-b:a', '320k',
@@ -1369,7 +2089,9 @@ async function saveGpuClip(payload) {
     audioSegments: audioChunks.length,
     systemAudioSegments: systemAudioChunks.length,
     micAudioSegments: micAudioChunks.length,
-    clipDurationSeconds
+    clipDurationSeconds,
+    requestedAt,
+    availableAt
   });
   return {
     filePath,
@@ -1549,11 +2271,12 @@ async function stripClipAudio(payload) {
   return { filePath: outputPath, clips: await listClips() };
 }
 
-function listAudioApps() {
+function listRunningApps(options = {}) {
+  const visibleOnly = Boolean(options.visibleOnly);
   return new Promise((resolve) => {
     const script = [
       '[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;',
-      'Get-Process | Where-Object { $_.MainWindowTitle } |',
+      visibleOnly ? 'Get-Process | Where-Object { $_.MainWindowTitle } |' : 'Get-Process |',
       'Select-Object @{n="processId";e={[string]$_.Id}},@{n="name";e={$_.ProcessName}},@{n="title";e={$_.MainWindowTitle}} |',
       'ConvertTo-Json -Compress'
     ].join(' ');
@@ -1574,7 +2297,7 @@ function listAudioApps() {
         const seen = new Set();
         resolve(
           rows
-            .filter((row) => row && row.processId && row.title && row.title !== APP_NAME)
+            .filter((row) => row && row.processId && row.name && (!visibleOnly || row.title) && row.title !== APP_NAME)
             .map((row) => ({
               processId: String(row.processId),
               name: String(row.name || 'App'),
@@ -1592,6 +2315,10 @@ function listAudioApps() {
       }
     });
   });
+}
+
+function listAudioApps() {
+  return listRunningApps({ visibleOnly: true });
 }
 
 async function listClips() {
